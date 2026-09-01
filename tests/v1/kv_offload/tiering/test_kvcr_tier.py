@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Collection, Iterable, Mapping
+from typing import Any
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ import pytest
 pytest.importorskip("kvcr")
 
 from kvcr import KVCRBindings
+from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import G3Options, KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy, LRUPolicy
 from kvcr.types import (
@@ -72,15 +74,7 @@ class RecordingKVCR:
         self.inventory_sink = None
         self.query_status = QueryStatus.MISS
         self.stats: OffloadingConnectorStats | None = None
-        self.submit_hint_calls: list[
-            tuple[
-                list[BlockKey],
-                str | None,
-                str,
-                object | None,
-                str | None,
-            ]
-        ] = []
+        self.submit_hint_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.discard_hint_calls: list[str] = []
         self.deliver_calls: list[
             tuple[OpHandle, dict[BlockKey, MemDescriptor], str | None]
@@ -89,17 +83,8 @@ class RecordingKVCR:
         self.completed: list[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = []
         self._next_op_handle = 1
 
-    def submit_hint(
-        self,
-        block_key_list: Collection[BlockKey],
-        src: str | None = None,
-        mode: str = "copy",
-        hints: object | None = None,
-        request_id: str | None = None,
-    ) -> None:
-        self.submit_hint_calls.append(
-            (list(block_key_list), src, mode, hints, request_id)
-        )
+    def submit_hint(self, *args: Any, **kwargs: Any) -> None:
+        self.submit_hint_calls.append((args, kwargs))
 
     def discard_hint(self, request_id: str) -> None:
         self.discard_hint_calls.append(request_id)
@@ -282,20 +267,41 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
     """Exercise the complete vLLM router-hint-to-KVCR load translation."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
-    router_hint = {
-        "source_control_endpoint": "tcp://source:1234",
-        "block_hashes": [123],
-        "target_cached_prefix_blocks": 0,
-    }
-    ctx = ReqContext(req_id="req", kv_transfer_params={"router_hint": router_hint})
+    hint = KvSourceLocationsHint("tcp://source:1234", frozenset({123}))
+    kv_transfer_params = {"opaque": object()}
+    # Patch the parser binding imported by vLLM's manager, not KVCR's parser
+    # implementation. This keeps the vLLM test independent of the raw
+    # router_hint wire shape while verifying the manager passes through this
+    # request's kv_transfer_params object.
+    monkeypatch.setattr(
+        kvcr_manager,
+        "extract_kv_hint",
+        lambda params: hint if params is kv_transfer_params else None,
+    )
+    ctx = ReqContext(req_id="req", kv_transfer_params=kv_transfer_params)
     key = make_offload_key((123).to_bytes(8, "big"), 0)
     same_hash_other_group = make_offload_key((123).to_bytes(8, "big"), 7)
     other_key = make_offload_key((124).to_bytes(8, "big"), 0)
 
     tier.on_new_request(ctx)
-    assert len(kvcr.submit_hint_calls) == 1
-    _, source, mode, hint, request_id = kvcr.submit_hint_calls[0]
-    assert (source, mode, request_id) == ("tcp://source:1234", "copy", "req")
+
+    # Here we verify that the manager submits one KVCR hint request with the
+    # expected arguments: no block keys, copy mode, the request id, and
+    # the exact typed hint returned by extract_kv_hint.
+    assert len(kvcr.submit_hint_calls) == 1, "test expected exactly one submitted KVCR hint"
+    args, kwargs = kvcr.submit_hint_calls[0]
+    assert len(args) == 1, "submit_hint should receive one positional arg: block_key_list"
+    assert args[0] == (), "block_key_list is expected to be empty"
+    assert len(kwargs) == 3, (
+        "submit_hint should receive three kwargs: mode, request_id, and hints"
+    )
+    assert kwargs["mode"] == "copy", "test expected copy mode in the hint"
+    assert kwargs["request_id"] == "req", "manager should preserve the request id"
+    assert kwargs["hints"] is hint, "manager should pass through the parsed typed hint (the same object reference)"
+
+    # Here we verify that the manager-installed key adapter matches keys by
+    # external block hash. The same hash in another group should match, while a
+    # different hash should not match.
     bindings = kvcr.constructor_bindings
     assert bindings is not None
     assert bindings.key_hint_adapter is not None
@@ -307,6 +313,9 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
 
     tier.submit_load(_job(7, ctx, key=key, block_id=2))
 
+    # Here we verify that submitting a load for a hinted key asks KVCR to
+    # deliver that key into the expected primary memory slot and completes the
+    # vLLM transfer job successfully.
     assert len(kvcr.submit_hint_calls) == 1
     _, blocks, request_id = kvcr.deliver_calls[0]
     assert request_id == "req"
@@ -316,6 +325,8 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
     assert blocks[key].size == 16
     assert list(tier.get_finished_jobs()) == [JobResult(7, True)]
 
+    # Here we verify that request cleanup discards the request-scoped hint in
+    # KVCR.
     tier.on_request_finished(ctx)
     assert kvcr.discard_hint_calls == ["req"]
 

@@ -8,7 +8,6 @@ import socket
 import time
 import uuid
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,6 +18,11 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
     KVCRBindings,
+)
+from kvcr.kv_hints import (
+    ROUTER_HINT_CAPABILITIES,
+    KvSourceLocationsHint,
+    extract_kv_hint,
 )
 from kvcr.config import (
     FrameworkDramInput,
@@ -57,7 +61,6 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
-    ExternalBlockHash,
     maybe_convert_block_hash,
 )
 from vllm.v1.kv_offload.base import (
@@ -84,7 +87,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_offload.base import OffloadingSpec
 
 
-_REQUIRED_ROUTER_CAPABILITIES = {"router_hint"}
+_REQUIRED_ROUTER_CAPABILITIES = ROUTER_HINT_CAPABILITIES
 
 logger = init_logger(__name__)
 
@@ -244,34 +247,6 @@ class _FrameworkPinAdapter:
         return results
 
 
-@dataclass(frozen=True)
-class _RouterHint:
-    source: str
-    block_hashes: frozenset[ExternalBlockHash]
-
-
-def _parse_router_hint(
-    kv_transfer_params: dict[str, Any] | None,
-) -> _RouterHint | None:
-    if not kv_transfer_params:
-        return None
-    router_hint = kv_transfer_params.get("router_hint")
-    if not isinstance(router_hint, dict):
-        return None
-    location = router_hint.get("source_control_endpoint")
-    if not isinstance(location, str) or not location:
-        return None
-    block_hashes = router_hint.get("block_hashes")
-    if not isinstance(block_hashes, list) or not block_hashes:
-        return None
-
-    planned_hashes: set[ExternalBlockHash] = set()
-    for block_hash in block_hashes:
-        if isinstance(block_hash, bool) or not isinstance(block_hash, (bytes, int)):
-            return None
-        planned_hashes.add(block_hash)
-    return _RouterHint(location, frozenset(planned_hashes))
-
 
 class _VllmKeyHintAdapter:
     """Adapt vLLM's local key format to router-hint membership."""
@@ -282,7 +257,7 @@ class _VllmKeyHintAdapter:
         return BlockKey(framework_key)
 
     def matches(self, key: BlockKey, hint: object) -> bool:
-        if not isinstance(hint, _RouterHint):
+        if not isinstance(hint, KvSourceLocationsHint):
             return False
         block_hash = BlockHash(get_offload_block_hash(OffloadKey(key)))
         return maybe_convert_block_hash(block_hash) in hint.block_hashes
@@ -596,11 +571,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        hint = _parse_router_hint(req_context.kv_transfer_params)
+        hint = extract_kv_hint(req_context.kv_transfer_params)
         if hint is not None:
             self._kvcr.submit_hint(
                 (),
-                src=hint.source,
                 mode="copy",
                 request_id=req_context.req_id,
                 hints=hint,
