@@ -7,7 +7,7 @@ import mmap
 import socket
 import time
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,6 +19,7 @@ from kvcr import (
     TRANSFER_BYTES_METRIC,
     KVCRBindings,
     ROUTER_HINT_CAPABILITIES,
+    ROUTER_HINT_KEY,
 )
 from kvcr.config import (
     FrameworkDramInput,
@@ -84,7 +85,6 @@ if TYPE_CHECKING:
 
 
 _REQUIRED_ROUTER_CAPABILITIES = ROUTER_HINT_CAPABILITIES
-_ROUTER_HINT_KEY = "router_hint"
 
 logger = init_logger(__name__)
 
@@ -566,12 +566,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        params = req_context.kv_transfer_params
-        if params is not None and _ROUTER_HINT_KEY in params:
-            self._kvcr.submit_hint(
-                request_id=req_context.req_id,
-                hints=params[_ROUTER_HINT_KEY],
-            )
+        params = getattr(req_context, "kv_transfer_params", None)
+        if isinstance(params, Mapping):
+            hint = params.get(ROUTER_HINT_KEY)
+            if hint is not None:
+                self._kvcr.submit_hint(
+                    request_id=req_context.req_id,
+                    hints=hint,
+                )
         return RequestOffloadingContext()
 
     @override
