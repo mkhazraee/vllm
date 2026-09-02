@@ -18,16 +18,12 @@ from kvcr import (
     TRANSFER_BLOCKS_METRIC,
     TRANSFER_BYTES_METRIC,
     KVCRBindings,
-)
-from kvcr.kv_hints import (
     ROUTER_HINT_CAPABILITIES,
-    KvSourceLocationsHint,
-    extract_kv_hint,
 )
 from kvcr.config import (
     FrameworkDramInput,
     G3Options,
-    KeyHintAdapter,
+    KeyAdapter,
     KVCRBackendConfigs,
     KVCRConfig,
     KVCRGuardConfig,
@@ -88,6 +84,7 @@ if TYPE_CHECKING:
 
 
 _REQUIRED_ROUTER_CAPABILITIES = ROUTER_HINT_CAPABILITIES
+_ROUTER_HINT_KEY = "router_hint"
 
 logger = init_logger(__name__)
 
@@ -248,19 +245,17 @@ class _FrameworkPinAdapter:
 
 
 
-class _VllmKeyHintAdapter:
-    """Adapt vLLM's local key format to router-hint membership."""
+class _VllmKeyAdapter:
+    """Adapt vLLM's local key format to KVCR."""
 
     def encode(self, framework_key: object) -> BlockKey:
         if not isinstance(framework_key, bytes):
             raise TypeError("vLLM offload keys must be bytes")
         return BlockKey(framework_key)
 
-    def matches(self, key: BlockKey, hint: object) -> bool:
-        if not isinstance(hint, KvSourceLocationsHint):
-            return False
+    def decode(self, key: BlockKey) -> int | bytes:
         block_hash = BlockHash(get_offload_block_hash(OffloadKey(key)))
-        return maybe_convert_block_hash(block_hash) in hint.block_hashes
+        return maybe_convert_block_hash(block_hash)
 
 
 # Job ID, remaining blocks, aggregate success, and successful load keys.
@@ -327,7 +322,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             raise ValueError(
                 "KVCR local G2/G3 inventory requires self_describing_kv_events"
             )
-        self._key_hint_adapter: KeyHintAdapter = _VllmKeyHintAdapter()
+        self._key_adapter: KeyAdapter = _VllmKeyAdapter()
         advertise_host = control_advertise_host or socket.gethostname()
         dp_local_rank = offloading_spec.config.parallel.data_parallel_rank_local
         if dp_local_rank is None:
@@ -418,7 +413,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     release_pin=self._framework_pin_adapter.release_pin,
                     cancel_pin_request=(self._framework_pin_adapter.cancel_pin_request),
                     framework_control=control,
-                    key_hint_adapter=self._key_hint_adapter,
+                    key_adapter=self._key_adapter,
                     inventory_sink=(self._record_inventory if events_enabled else None),
                     stats_factory=(
                         OffloadingConnectorStats if enable_telemetry else None
@@ -450,7 +445,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        block_key = self._key_hint_adapter.encode(key)
+        block_key = self._key_adapter.encode(key)
         status, _ = self._kvcr.query((block_key,), req_context.req_id)[0]
         if status is QueryStatus.FETCHING:
             return LookupResult.RETRY
@@ -461,7 +456,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
         blocks = {
-            self._key_hint_adapter.encode(key): self._make_descriptor(int(block_id))
+            self._key_adapter.encode(key): self._make_descriptor(int(block_id))
             for key, block_id in zip(
                 job_metadata.keys, job_metadata.block_ids, strict=True
             )
@@ -485,7 +480,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         blocks = {
-            self._key_hint_adapter.encode(key): self._make_descriptor(int(block_id))
+            self._key_adapter.encode(key): self._make_descriptor(int(block_id))
             for key, block_id in zip(
                 job_metadata.keys, job_metadata.block_ids, strict=True
             )
@@ -571,13 +566,11 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        hint = extract_kv_hint(req_context.kv_transfer_params)
-        if hint is not None:
+        params = req_context.kv_transfer_params
+        if params is not None and _ROUTER_HINT_KEY in params:
             self._kvcr.submit_hint(
-                (),
-                mode="copy",
                 request_id=req_context.req_id,
-                hints=hint,
+                hints=params[_ROUTER_HINT_KEY],
             )
         return RequestOffloadingContext()
 

@@ -11,7 +11,6 @@ import pytest
 pytest.importorskip("kvcr")
 
 from kvcr import KVCRBindings
-from kvcr.kv_hints import KvSourceLocationsHint
 from kvcr.config import G3Options, KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy, LRUPolicy
 from kvcr.types import (
@@ -267,49 +266,34 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
     """Exercise the complete vLLM router-hint-to-KVCR load translation."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
-    hint = KvSourceLocationsHint("tcp://source:1234", frozenset({123}))
-    kv_transfer_params = {"opaque": object()}
-    # Patch the parser binding imported by vLLM's manager, not KVCR's parser
-    # implementation. This keeps the vLLM test independent of the raw
-    # router_hint wire shape while verifying the manager passes through this
-    # request's kv_transfer_params object.
-    monkeypatch.setattr(
-        kvcr_manager,
-        "extract_kv_hint",
-        lambda params: hint if params is kv_transfer_params else None,
+    router_hint = {
+        "source_control_endpoint": "tcp://source:1234",
+        "block_hashes": [123],
+        "framework_hint": {"opaque": True},
+    }
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={"router_hint": router_hint, "unrelated": object()},
     )
-    ctx = ReqContext(req_id="req", kv_transfer_params=kv_transfer_params)
     key = make_offload_key((123).to_bytes(8, "big"), 0)
     same_hash_other_group = make_offload_key((123).to_bytes(8, "big"), 7)
     other_key = make_offload_key((124).to_bytes(8, "big"), 0)
 
     tier.on_new_request(ctx)
 
-    # Here we verify that the manager submits one KVCR hint request with the
-    # expected arguments: no block keys, copy mode, the request id, and
-    # the exact typed hint returned by extract_kv_hint.
-    assert len(kvcr.submit_hint_calls) == 1, "test expected exactly one submitted KVCR hint"
-    args, kwargs = kvcr.submit_hint_calls[0]
-    assert len(args) == 1, "submit_hint should receive one positional arg: block_key_list"
-    assert args[0] == (), "block_key_list is expected to be empty"
-    assert len(kwargs) == 3, (
-        "submit_hint should receive three kwargs: mode, request_id, and hints"
-    )
-    assert kwargs["mode"] == "copy", "test expected copy mode in the hint"
-    assert kwargs["request_id"] == "req", "manager should preserve the request id"
-    assert kwargs["hints"] is hint, "manager should pass through the parsed typed hint (the same object reference)"
+    assert kvcr.submit_hint_calls == [
+        ((), {"request_id": "req", "hints": router_hint})
+    ]
 
-    # Here we verify that the manager-installed key adapter matches keys by
-    # external block hash. The same hash in another group should match, while a
-    # different hash should not match.
     bindings = kvcr.constructor_bindings
     assert bindings is not None
-    assert bindings.key_hint_adapter is not None
-    assert bindings.key_hint_adapter.matches(BlockKey(bytes(key)), hint)
-    assert bindings.key_hint_adapter.matches(
-        BlockKey(bytes(same_hash_other_group)), hint
-    )
-    assert not bindings.key_hint_adapter.matches(BlockKey(bytes(other_key)), hint)
+    assert bindings.key_adapter is not None
+    monkeypatch.setenv("VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES", "0")
+    decode = bindings.key_adapter.decode
+    hash_123 = (123).to_bytes(8, "big")
+    assert decode(BlockKey(bytes(key))) == hash_123
+    assert decode(BlockKey(bytes(same_hash_other_group))) == hash_123
+    assert decode(BlockKey(bytes(other_key))) == (124).to_bytes(8, "big")
 
     tier.submit_load(_job(7, ctx, key=key, block_id=2))
 
