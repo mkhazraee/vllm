@@ -218,6 +218,8 @@ def _make_tier(
         compatibility_digest=compatibility_digest,
         policy=policy,
         g3=g3,
+        local_dram_backend="UCX",
+        remote_fw_dram_backend="UCX",
     )
 
 
