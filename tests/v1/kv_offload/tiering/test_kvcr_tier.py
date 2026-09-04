@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("kvcr")
 
-from kvcr import KVCRBindings
+from kvcr import KVCRBindings, ROUTER_HINT_KEY
 from kvcr.config import G3Options, KVCRBackendConfigs, KVCRConfig, KVCRGuardConfig
 from kvcr.policy import FIFOPolicy, G3FIFOPolicy, G3LRUPolicy, LRUPolicy
 from kvcr.types import (
@@ -275,7 +275,7 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
     }
     ctx = ReqContext(
         req_id="req",
-        kv_transfer_params={"router_hint": router_hint, "unrelated": object()},
+        kv_transfer_params={ROUTER_HINT_KEY: router_hint, "unrelated": object()},
     )
     key = make_offload_key((123).to_bytes(8, "big"), 0)
     same_hash_other_group = make_offload_key((123).to_bytes(8, "big"), 7)
