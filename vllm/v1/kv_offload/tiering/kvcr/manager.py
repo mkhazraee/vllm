@@ -385,7 +385,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         guard_config = (
             KVCRGuardConfig(
                 kvcr_service_socket_path=kvcr_service_socket_path,
-                pool_index=dp_local_rank,
+                guard_index=dp_local_rank,
                 row_stride=self._primary_row_stride,
                 compatibility_digest=compatibility_digest,
             )

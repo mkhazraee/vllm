@@ -240,7 +240,7 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
     assert kvcr.framework_control.endpoint == "tcp://127.0.0.1:7002"
     assert kvcr.guard_config == KVCRGuardConfig(
         kvcr_service_socket_path="/tmp/kvcr.sock",
-        pool_index=1,
+        guard_index=1,
         row_stride=tier._primary_row_stride,
         compatibility_digest="Opaque-Digest",
     )
