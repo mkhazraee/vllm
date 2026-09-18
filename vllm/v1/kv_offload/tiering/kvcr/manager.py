@@ -73,6 +73,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     get_offload_block_hash,
 )
+from vllm.v1.kv_offload.cpu.policies.base import order_request_keys
 from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     ParentManager,
@@ -257,8 +258,8 @@ class _VllmKeyAdapter:
         return maybe_convert_block_hash(block_hash)
 
 
-# Job ID, remaining blocks, aggregate success, and successful load keys.
-_JobState = tuple[int, int, bool, set[OffloadKey] | None]
+# Job metadata, remaining blocks, aggregate success, and successful load keys.
+_JobState = tuple[TransferJob, int, bool, set[OffloadKey] | None]
 
 
 class KVCRSecondaryTierManager(SecondaryTierManager):
@@ -480,7 +481,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             blocks, request_id=job_metadata.req_context.req_id
         )
         self._jobs_by_op[op_handle] = (
-            job_metadata.job_id,
+            job_metadata,
             len(blocks),
             True,
             set(),
@@ -501,7 +502,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             return
         op_handle = self._kvcr.deposit(blocks)
         self._jobs_by_op[op_handle] = (
-            job_metadata.job_id,
+            job_metadata,
             len(blocks),
             True,
             None,
@@ -534,7 +535,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             job_state = self._jobs_by_op.get(op_handle)
             if job_state is None:
                 continue
-            job_id, remaining, success, successful_keys = job_state
+            job, remaining, success, successful_keys = job_state
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
             if successful_keys is not None:
@@ -545,16 +546,23 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 )
             if remaining > 0:
                 self._jobs_by_op[op_handle] = (
-                    job_id,
+                    job,
                     remaining,
                     success,
                     successful_keys,
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
+            # Include earlier resident keys, even when only the tail transferred.
+            positions = job.req_context._offload_key_positions
+            end_token = max((positions.get(key, -1) for key in job.keys), default=-1)
+            self._align_sequence(
+                [key for key, position in positions.items() if position <= end_token],
+                job.req_context,
+            )
             results.append(
                 JobResult(
-                    job_id=job_id,
+                    job_id=job.job_id,
                     success=success,
                     successful_keys=successful_keys if not success else None,
                 )
@@ -586,7 +594,27 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         return RequestOffloadingContext()
 
     @override
+    def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self._align_sequence(keys, req_context, use_current_time=True)
+
+    def _align_sequence(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+        use_current_time: bool = False,
+    ) -> None:
+        if not keys:
+            return
+        ordered_keys = order_request_keys((list(keys),), req_context)
+        self._kvcr.align_sequence(
+            [self._key_adapter.encode(key) for key in ordered_keys],
+            use_current_time=use_current_time,
+        )
+
+    @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        # The scheduler finalizes request recency instead of issuing touches.
+        self.touch(req_context._offload_key_positions, req_context)
         self._kvcr.discard_hint(req_context.req_id)
 
     @override

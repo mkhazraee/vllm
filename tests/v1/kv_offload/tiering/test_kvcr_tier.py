@@ -75,6 +75,7 @@ class RecordingKVCR:
         self.stats: OffloadingConnectorStats | None = None
         self.submit_hint_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.discard_hint_calls: list[str] = []
+        self.align_sequence_calls: list[tuple[list[BlockKey], bool]] = []
         self.deliver_calls: list[
             tuple[OpHandle, dict[BlockKey, list[MemDescriptor]], str | None]
         ] = []
@@ -89,6 +90,11 @@ class RecordingKVCR:
 
     def discard_hint(self, request_id: str) -> None:
         self.discard_hint_calls.append(request_id)
+
+    def align_sequence(
+        self, keys: list[BlockKey], use_current_time: bool = False
+    ) -> None:
+        self.align_sequence_calls.append((list(keys), use_current_time))
 
     def query(
         self,
@@ -318,9 +324,43 @@ def test_kvcr_tier_allows_request_without_router_hint(monkeypatch):
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
 
-    tier.on_new_request(ReqContext(req_id="req"))
+    ctx = ReqContext(req_id="req")
+    keys = [make_offload_key(bytes([index]), 0) for index in range(2)]
+    for position, key in enumerate(keys):
+        ctx.set_offload_key_position(key, position * 16)
+    tier.on_new_request(ctx)
+    tier.on_request_finished(ctx)
 
     assert kvcr.submit_hint_calls == []
+    # Primary-only requests still refresh the secondary's resident prefix.
+    assert kvcr.align_sequence_calls == [(keys, True)]
+
+
+@pytest.mark.parametrize("operation", ["submit_load", "submit_store"])
+@pytest.mark.parametrize("finish_before_transfer", [False, True])
+def test_kvcr_tier_aligns_full_prefix_around_transfer_completion(
+    monkeypatch, operation, finish_before_transfer
+):
+    """Align completed prefixes even when the request has already finished."""
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    ctx = ReqContext(req_id="req")
+    head, tail, future_tail = (OffloadKey(key) for key in (b"head", b"tail", b"future"))
+    for key, end_token in ((tail, 32), (head, 16), (future_tail, 48)):
+        ctx.set_offload_key_position(key, end_token)
+    tier.on_new_request(ctx)
+    getattr(tier, operation)(_job(7, ctx, key=tail))
+    assert kvcr.align_sequence_calls == []
+
+    if finish_before_transfer:
+        tier.on_request_finished(ctx)
+    assert list(tier.get_finished_jobs()) == [JobResult(7, True)]
+    if not finish_before_transfer:
+        tier.on_request_finished(ctx)
+    expected = [([head, tail], False), ([head, tail, future_tail], True)]
+    assert kvcr.align_sequence_calls == (
+        list(reversed(expected)) if finish_before_transfer else expected
+    )
 
 
 @pytest.mark.parametrize(
