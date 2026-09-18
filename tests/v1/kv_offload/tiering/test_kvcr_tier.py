@@ -319,7 +319,12 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch):
     assert kvcr.discard_hint_calls == ["req"]
 
 
-def test_kvcr_tier_allows_request_without_router_hint(monkeypatch):
+@pytest.mark.parametrize(
+    ("processed_tokens", "expected_keys"), [(None, 2), (0, 0), (16, 1), (32, 2)]
+)
+def test_kvcr_tier_allows_request_without_router_hint(
+    monkeypatch, processed_tokens, expected_keys
+):
     """Keep router hints optional for requests from non-hint-aware routers."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
@@ -327,13 +332,17 @@ def test_kvcr_tier_allows_request_without_router_hint(monkeypatch):
     ctx = ReqContext(req_id="req")
     keys = [make_offload_key(bytes([index]), 0) for index in range(2)]
     for position, key in enumerate(keys):
-        ctx.set_offload_key_position(key, position * 16)
+        ctx.set_offload_key_position(key, (position + 1) * 16)
+    ctx.num_processed_tokens = processed_tokens
     tier.on_new_request(ctx)
     tier.on_request_finished(ctx)
 
     assert kvcr.submit_hint_calls == []
-    # Primary-only requests still refresh the secondary's resident prefix.
-    assert kvcr.align_sequence_calls == [(keys, True)]
+    # Refresh primary-only reuse, excluding the unprocessed suffix on abort.
+    assert kvcr.align_sequence_calls == (
+        [(keys[:expected_keys], True)] if expected_keys else []
+    )
+    assert list(ctx._offload_key_positions) == keys
 
 
 @pytest.mark.parametrize("operation", ["submit_load", "submit_store"])

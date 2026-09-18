@@ -614,7 +614,13 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         # The scheduler finalizes request recency instead of issuing touches.
-        self.touch(req_context._offload_key_positions, req_context)
+        processed_tokens = req_context.num_processed_tokens
+        keys = [
+            key
+            for key, position in req_context._offload_key_positions.items()
+            if processed_tokens is None or position <= processed_tokens
+        ]
+        self.touch(keys, req_context)
         self._kvcr.discard_hint(req_context.req_id)
 
     @override
