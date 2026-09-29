@@ -611,7 +611,19 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         # The scheduler finalizes request recency instead of issuing touches.
-        processed_tokens = req_context.num_processed_tokens
+        processed_tokens = req_context.num_computed_tokens
+        if processed_tokens is not None:
+            in_flight = req_context.num_in_flight_tokens
+            prompt_tokens = req_context.num_prompt_tokens
+            num_tokens = req_context.num_tokens
+            assert in_flight is not None
+            assert prompt_tokens is not None
+            assert num_tokens is not None
+            # Exclude in-flight work and the uncommitted final sampled token.
+            processed_tokens = min(
+                max(0, processed_tokens - in_flight),
+                max(prompt_tokens, num_tokens - 1),
+            )
         keys = [
             key
             for key, position in req_context._offload_key_positions.items()

@@ -324,21 +324,40 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("processed_tokens", "expected_keys"), [(None, 2), (0, 0), (16, 1), (32, 2)]
+    ("computed", "in_flight", "num_tokens", "expected_keys"),
+    [
+        (None, None, None, 5),
+        (32, 16, 64, 1),
+        (16, 16, 64, 0),
+        (0, 16, 64, 0),
+        (64, 0, 64, 4),
+        (80, 0, 80, 4),
+    ],
 )
-def test_kvcr_tier_allows_request_without_router_hint(
-    monkeypatch, processed_tokens, expected_keys
+def test_kvcr_tier_refreshes_processed_prefix(
+    monkeypatch, computed, in_flight, num_tokens, expected_keys
 ):
-    """Keep router hints optional for requests from non-hint-aware routers."""
+    """Refresh only processed keys using the latest request token counts."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
 
-    ctx = ReqContext(req_id="req")
-    keys = [make_offload_key(bytes([index]), 0) for index in range(2)]
+    request = (
+        SimpleNamespace(
+            num_computed_tokens=0,
+            num_in_flight_tokens=in_flight,
+            num_prompt_tokens=64,
+            num_tokens=num_tokens,
+        )
+        if computed is not None
+        else None
+    )
+    ctx = ReqContext(req_id="req", _request=request)
+    keys = [make_offload_key(bytes([index]), 0) for index in range(5)]
     for position, key in enumerate(keys):
         ctx.set_offload_key_position(key, (position + 1) * 16)
-    ctx.num_processed_tokens = processed_tokens
     tier.on_new_request(ctx)
+    if request is not None:
+        request.num_computed_tokens = computed
     tier.on_request_finished(ctx)
 
     assert kvcr.submit_hint_calls == []
@@ -357,7 +376,15 @@ def test_kvcr_tier_aligns_full_prefix_around_transfer_completion(
     """Align completed prefixes even when the request has already finished."""
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr)
-    ctx = ReqContext(req_id="req")
+    ctx = ReqContext(
+        req_id="req",
+        _request=SimpleNamespace(
+            num_computed_tokens=48,
+            num_in_flight_tokens=16,
+            num_prompt_tokens=64,
+            num_tokens=64,
+        ),
+    )
     head, tail, future_tail = (OffloadKey(key) for key in (b"head", b"tail", b"future"))
     for key, end_token in ((tail, 32), (head, 16), (future_tail, 48)):
         ctx.set_offload_key_position(key, end_token)
@@ -370,7 +397,7 @@ def test_kvcr_tier_aligns_full_prefix_around_transfer_completion(
     assert list(tier.get_finished_jobs()) == [JobResult(7, True)]
     if not finish_before_transfer:
         tier.on_request_finished(ctx)
-    expected = [([head, tail], False), ([head, tail, future_tail], True)]
+    expected = [([head, tail], False), ([head, tail], True)]
     assert kvcr.align_sequence_calls == (
         list(reversed(expected)) if finish_before_transfer else expected
     )
