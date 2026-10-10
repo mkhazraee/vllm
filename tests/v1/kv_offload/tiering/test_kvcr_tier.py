@@ -373,6 +373,13 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     chunk_ids = {keys[0]: 1, keys[2]: 3}
     lifecycle: list[str] = []
 
+    # Reuse the slot reference across keys without reusing pin ownership.
+    tier.submit_load(
+        _job(7, ReqContext(req_id="load"), key=OffloadKey(keys[0]), chunk_id=3)
+    )
+    load_descriptors = kvcr.deliver_calls[0][1][keys[0]]
+    assert list(tier.get_finished_jobs()) == [JobResult(7, True)]
+
     class Parent:
         def on_new_request(self, req_context):
             lifecycle.append("new")
@@ -408,6 +415,11 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     assert block_descriptors is not None
     (descriptor,) = block_descriptors
     assert descriptor == MemoryRef(end_point_name=kvcr.nixl_agent_name, element_index=3)
+    assert descriptors[keys[0]] == [
+        MemoryRef(end_point_name=kvcr.nixl_agent_name, element_index=1)
+    ]
+    assert descriptor is load_descriptors[0]
+    assert block_descriptors is not load_descriptors
     assert lifecycle == ["new", "finished"]
 
     polls = 0

@@ -455,6 +455,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._local_dram_mmap = local_mapping
         self._finished_jobs: list[JobResult] = []
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
+        # The registered region and agent are fixed for this manager's lifetime.
+        self._descriptor_cache: dict[int, MemoryRef] = {}
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -626,7 +628,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         )
 
     def _make_descriptor(self, chunk_id: int) -> MemoryRef:
-        return MemoryRef(
-            end_point_name=self._kvcr.config.nixl_agent_name,
-            element_index=chunk_id,
-        )
+        descriptor = self._descriptor_cache.get(chunk_id)
+        if descriptor is None:
+            descriptor = self._descriptor_cache[chunk_id] = MemoryRef(
+                end_point_name=self._kvcr.config.nixl_agent_name,
+                element_index=chunk_id,
+            )
+        return descriptor
