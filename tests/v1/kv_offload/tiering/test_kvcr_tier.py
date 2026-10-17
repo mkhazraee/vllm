@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
-import msgspec
 import numpy as np
 import pytest
 
@@ -184,6 +183,7 @@ def _make_tier(
     startup_error: BaseException | None = None,
     primary_kv_view: memoryview | None = None,
     enable_telemetry: bool = False,
+    framework_pinning: bool | None = None,
     secondary_g2_slots: int = 0,
     kvcr_service_socket_path: str | None = None,
     compatibility_digest: str | None = None,
@@ -229,6 +229,8 @@ def _make_tier(
     }
     if backpressure is not None:
         tier_config["backpressure"] = backpressure
+    if framework_pinning is not None:
+        tier_config["framework_pinning"] = framework_pinning
     tier = SecondaryTierFactory.create_secondary_tier(
         tier_config=tier_config,
         offloading_spec=SimpleNamespace(
@@ -297,7 +299,8 @@ def test_startup_failure_cleanup(monkeypatch, error_type, secondary_g2_slots):
         region.close()
 
 
-def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
+@pytest.mark.parametrize("framework_pinning", [None, True, False])
+def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch, framework_pinning):
     """Keep the control endpoint and guard pool aligned to the local DP rank."""
     kvcr = RecordingKVCR()
     tier = _make_tier(
@@ -305,6 +308,7 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
         kvcr,
         kvcr_service_socket_path="/tmp/kvcr.sock",
         compatibility_digest="Opaque-Digest",
+        framework_pinning=framework_pinning,
         secondary_g2_slots=1,
         control_ports=[7001, 7002],
         data_parallel_rank_local=1,
@@ -324,6 +328,9 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
     assert (region.size, region.stride or region.size, region.count) == (16, 16, 4)
     assert (region.label, region.mem_type, region.device_Id) == ("", "DRAM", 0)
     assert kvcr.backend_configs.local_dram is None
+    assert kvcr.backend_configs.remote_fw_dram.framework_pinning is (
+        framework_pinning is True
+    )
 
 
 def test_kvcr_tier_converts_g3_paths(monkeypatch, tmp_path):
@@ -367,9 +374,7 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch, backpressure):
 
     tier.on_new_request(ctx)
 
-    assert kvcr.submit_hint_calls == [
-        ((), {"request_id": "req", "hints": msgspec.to_builtins(kv_hint)})
-    ]
+    assert kvcr.submit_hint_calls == [((), {"request_id": "req", "hints": kv_hint})]
 
     bindings = kvcr.constructor_bindings
     assert bindings is not None

@@ -11,7 +11,6 @@ from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-import msgspec
 from kvcr import (
     DURATION_METRIC,
     KVCR,
@@ -296,6 +295,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         control_advertise_host: str | None = None,
         eager_ctrl_connect: bool = True,
         opportunistic_query: bool = True,
+        framework_pinning: bool = False,
         enable_telemetry: bool = False,
         operation_timeout_ms: int = 1000,
         abandon_timeout_ms: int = 5000,
@@ -452,6 +452,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     remote_fw_dram=RemoteFWDramOptions(
                         eager_ctrl_connect=eager_ctrl_connect,
                         opportunistic_query=opportunistic_query,
+                        framework_pinning=framework_pinning,
                         metadata_retry_interval_ms=metadata_retry_interval_ms,
                         backend=remote_fw_dram_backend,
                     ),
@@ -618,7 +619,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         if (hint := req_context.kv_hints) is not None:
             self._kvcr.submit_hint(
                 request_id=req_context.req_id,
-                hints=msgspec.to_builtins(hint),
+                hints=hint,
             )
         return RequestOffloadingContext()
 
