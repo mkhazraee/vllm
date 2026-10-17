@@ -295,6 +295,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         control_advertise_host: str | None = None,
         eager_ctrl_connect: bool = True,
         opportunistic_query: bool = True,
+        framework_pinning: bool = False,
         enable_telemetry: bool = False,
         operation_timeout_ms: int = 1000,
         abandon_timeout_ms: int = 5000,
@@ -411,6 +412,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             g3_config = G3Options(**g3_values)
         nixl_agent_name = f"KVCR-{uuid.uuid4()}"
         self._framework_pin_adapter = _FrameworkPinAdapter(self)
+        pinning = self._framework_pin_adapter if framework_pinning else None
         self._inventory_events: list[OffloadingEvent] = []
 
         try:
@@ -424,10 +426,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     nixl_listen_port=_nixl_listen_port,
                 ),
                 KVCRBindings(
-                    request_pin=self._framework_pin_adapter.request_pin,
-                    poll_pin_results=self._framework_pin_adapter.poll_pin_results,
-                    release_pin=self._framework_pin_adapter.release_pin,
-                    cancel_pin_request=(self._framework_pin_adapter.cancel_pin_request),
+                    request_pin=pinning.request_pin if pinning else None,
+                    poll_pin_results=(pinning.poll_pin_results if pinning else None),
+                    release_pin=pinning.release_pin if pinning else None,
+                    cancel_pin_request=(
+                        pinning.cancel_pin_request if pinning else None
+                    ),
                     framework_control=control,
                     key_adapter=self._key_adapter,
                     inventory_sink=(self._record_inventory if events_enabled else None),
