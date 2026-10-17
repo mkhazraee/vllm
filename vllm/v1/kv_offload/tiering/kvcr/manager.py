@@ -11,7 +11,6 @@ from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import msgspec
 from kvcr import (
     DURATION_METRIC,
     KVCR,
@@ -580,7 +579,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         if (hint := req_context.kv_hints) is not None:
             self._kvcr.submit_hint(
                 request_id=req_context.req_id,
-                hints=msgspec.to_builtins(hint),
+                hints=hint,
             )
         return RequestOffloadingContext()
 
