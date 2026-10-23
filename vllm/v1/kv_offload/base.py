@@ -467,6 +467,15 @@ class OffloadingManager(ABC):
         """
         return
 
+    def is_request_finalized(self, req_context: ReqContext) -> bool:
+        """Whether deferred finalization no longer needs live request counts.
+
+        Called after on_request_finished(). Managers that defer lower-tier
+        finalization must return False until those callbacks have completed.
+        Transfer completion is tracked separately by the connector.
+        """
+        return True
+
     def take_events(self) -> Iterable[OffloadingEvent]:
         """Take the offloading events from the manager.
 

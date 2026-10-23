@@ -1044,6 +1044,10 @@ class TieringOffloadingManager(OffloadingManager):
         state.is_finished = True
         self._maybe_finalize_request(req_context.req_id, exclude_tier_idx)
 
+    @override
+    def is_request_finalized(self, req_context: ReqContext) -> bool:
+        return req_context.req_id not in self._req_state
+
     def _maybe_finalize_request(
         self,
         req_id: str,

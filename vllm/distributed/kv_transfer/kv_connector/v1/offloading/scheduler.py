@@ -380,8 +380,6 @@ class RequestOffloadState:
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
-    # True once on_request_finished has been signaled to the manager.
-    finished_signaled: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -547,26 +545,34 @@ def _parse_tier_filter(raw: Any) -> TierFilter:
 
 @dataclass
 class _VllmReqContext(ReqContext):
-    _request: Request = field(kw_only=True, repr=False, compare=False)
+    _scheduler: "OffloadingConnectorScheduler" = field(
+        kw_only=True, repr=False, compare=False
+    )
 
     @property
-    def num_computed_tokens(self) -> int:
-        return self._request.num_computed_tokens
+    def num_computed_tokens(self) -> int | None:
+        status = self._scheduler._req_status.get(self.req_id)
+        return status.req.num_computed_tokens if status is not None else None
 
     @property
-    def num_in_flight_tokens(self) -> int:
-        return self._request.num_in_flight_tokens
+    def num_in_flight_tokens(self) -> int | None:
+        status = self._scheduler._req_status.get(self.req_id)
+        return status.req.num_in_flight_tokens if status is not None else None
 
     @property
-    def num_prompt_tokens(self) -> int:
-        return self._request.num_prompt_tokens
+    def num_prompt_tokens(self) -> int | None:
+        status = self._scheduler._req_status.get(self.req_id)
+        return status.req.num_prompt_tokens if status is not None else None
 
     @property
-    def num_tokens(self) -> int:
-        return self._request.num_tokens
+    def num_tokens(self) -> int | None:
+        status = self._scheduler._req_status.get(self.req_id)
+        return status.req.num_tokens if status is not None else None
 
 
-def _create_req_context(req: Request) -> ReqContext:
+def _create_req_context(
+    req: Request, scheduler: "OffloadingConnectorScheduler"
+) -> ReqContext:
     params = req.kv_transfer_params
     load_filter = TierFilter.ALL
     if params:
@@ -578,7 +584,7 @@ def _create_req_context(req: Request) -> ReqContext:
         kv_transfer_params=params,
         kv_hints=req.kv_hints,
         load_tier_filter=load_filter,
-        _request=req,
+        _scheduler=scheduler,
     )
 
 
@@ -636,6 +642,7 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        self._finished_req_ids: set[ReqId] = set()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -1117,16 +1124,20 @@ class OffloadingConnectorScheduler:
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
-        req_context = _create_req_context(request)
-        with self._manager_locked():
-            offloading_context = self.manager.on_new_request(req_context)
+        req_context = _create_req_context(request, self)
         req_status = RequestOffloadState(
             config=self.config,
             req=request,
             req_context=req_context,
-            offloading_context=offloading_context,
+            offloading_context=RequestOffloadingContext(),
         )
         self._req_status[request.request_id] = req_status
+        try:
+            with self._manager_locked():
+                req_status.offloading_context = self.manager.on_new_request(req_context)
+        except Exception:
+            del self._req_status[request.request_id]
+            raise
 
     def get_num_new_matched_tokens(
         self,
@@ -2005,13 +2016,13 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            req_status.finished_signaled = True
+            self._finished_req_ids.add(req_id)
             self.manager.on_request_finished(req_status.req_context)
-            if not req_status.transfer_jobs:
-                del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
+
+        self._cleanup_finished_requests()
 
         # Last manager call of the step, after every prepare_store and
         # on_request_finished above. on_schedule_end is documented as running at
@@ -2019,6 +2030,16 @@ class OffloadingConnectorScheduler:
         # exclusive access to the manager.
         self.manager.on_schedule_end(schedule_end_context)
         return meta
+
+    def _cleanup_finished_requests(self) -> None:
+        # The caller holds the manager lock while checking deferred finalization.
+        for req_id in tuple(self._finished_req_ids):
+            status = self._req_status[req_id]
+            if not status.transfer_jobs and self.manager.is_request_finalized(
+                status.req_context
+            ):
+                del self._req_status[req_id]
+                self._finished_req_ids.remove(req_id)
 
     def has_pending_push_work(self) -> bool:
         """Whether the engine must keep stepping.
@@ -2035,6 +2056,7 @@ class OffloadingConnectorScheduler:
         if self._jobs:
             return True
         with self._manager_locked():
+            self._cleanup_finished_requests()
             return self.manager.has_pending_work()
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
@@ -2118,8 +2140,7 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
-                del self._req_status[job_status.req_id]
+        self._cleanup_finished_requests()
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -2164,10 +2185,12 @@ class OffloadingConnectorScheduler:
         if req_status is None:
             # Untracked request (offloading never started): no in-flight jobs,
             # nothing was deferred, so finalize immediately.
-            req_context = _create_req_context(request)
+            self.on_new_request(request)
             with self._manager_locked():
-                self.manager.on_new_request(req_context)
-                self.manager.on_request_finished(req_context)
+                req_status = self._req_status[request.request_id]
+                self._finished_req_ids.add(request.request_id)
+                self.manager.on_request_finished(req_status.req_context)
+                self._cleanup_finished_requests()
             return False, None
 
         self._maybe_observe_lookup_async_delay(req_status)
@@ -2227,11 +2250,10 @@ class OffloadingConnectorScheduler:
         # Flush all in-flight jobs
         self._current_batch_jobs_to_flush.update(self._jobs.keys())
 
-        for req_id, status in list(self._req_status.items()):
-            if status.req.is_finished():
-                if not status.finished_signaled:
-                    self.manager.on_request_finished(status.req_context)
-                del self._req_status[req_id]
+        for req_id, status in self._req_status.items():
+            if status.req.is_finished() and req_id not in self._finished_req_ids:
+                self._finished_req_ids.add(req_id)
+                self.manager.on_request_finished(status.req_context)
 
         # Reset offloading manager cache
         self.manager.reset_cache()
@@ -2256,6 +2278,7 @@ class OffloadingConnectorScheduler:
         # The load flush IDs collected above must be delivered to workers.
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.clear()
+        self._cleanup_finished_requests()
 
     def shutdown(self) -> None:
         self.manager.shutdown()

@@ -1389,14 +1389,14 @@ class TestTieringOffloadingManager:
         assert not result.keys_to_store
         self.manager.on_request_finished(ctx)
 
-        assert ctx.req_id in self.manager._req_state
         assert self.manager.has_pending_work()
+        assert not self.manager.is_request_finalized(ctx)
 
         self.manager.complete_store(keys, writer_ctx, success=True)
         self._simulate_on_schedule_end()
 
         assert self._cascaded_keys_for(ctx.req_id) == [set(keys)]
-        assert ctx.req_id not in self.manager._req_state
+        assert self.manager.is_request_finalized(ctx)
 
     def test_cascade_drops_deferred_keys_whose_primary_write_failed(
         self, manager_setup, monkeypatch

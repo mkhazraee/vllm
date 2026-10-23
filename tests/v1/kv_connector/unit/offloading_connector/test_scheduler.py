@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import weakref
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, call
@@ -245,7 +246,7 @@ def test_create_req_context_preserves_kv_hints():
         kv_hints=kv_hints,
     )
 
-    assert _create_req_context(request).kv_hints is kv_hints
+    assert _create_req_context(request, MagicMock()).kv_hints is kv_hints
 
 
 def _reduce_kv_connector_stats(runner):
@@ -1502,12 +1503,52 @@ def test_req_context_token_counts_follow_request(token_count):
         kv_hints=None,
         **{token_count: 0},
     )
-    ctx = _create_req_context(request)
+    scheduler = SimpleNamespace(
+        _req_status={request.request_id: SimpleNamespace(req=request)}
+    )
+    ctx = _create_req_context(request, scheduler)
 
     assert getattr(ctx, token_count) == 0
     setattr(request, token_count, 32)
     assert getattr(ctx, token_count) == 32
     assert getattr(ReqContext(req_id="synthetic"), token_count) is None
+
+
+def test_request_retained_until_transfers_and_finalization_finish():
+    """Deferred finalization reads live counts without contexts owning requests."""
+
+    class RequestStub(SimpleNamespace):
+        pass
+
+    request = RequestStub(
+        request_id="req", kv_transfer_params=None, kv_hints=None, num_computed_tokens=16
+    )
+    request_ref = weakref.ref(request)
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler.manager = MagicMock(spec=OffloadingManager)
+    scheduler._finished_req_ids = {request.request_id}
+    ctx = _create_req_context(request, scheduler)
+    scheduler._req_status = {
+        request.request_id: SimpleNamespace(
+            req=request, req_context=ctx, transfer_jobs=set()
+        )
+    }
+    scheduler.manager.is_request_finalized.return_value = False
+    scheduler._cleanup_finished_requests()
+    request.num_computed_tokens = 32
+    assert ctx.num_computed_tokens == 32
+
+    scheduler.manager.is_request_finalized.return_value = True
+    scheduler._req_status[request.request_id].transfer_jobs.add(1)
+    scheduler._cleanup_finished_requests()
+    assert ctx.num_computed_tokens == 32
+
+    scheduler._req_status[request.request_id].transfer_jobs.clear()
+    del request
+    scheduler._cleanup_finished_requests()
+    assert request_ref() is None
+    assert not scheduler._finished_req_ids
+    assert ctx.num_computed_tokens is None
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
