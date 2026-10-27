@@ -1246,13 +1246,14 @@ class TieringOffloadingManager(OffloadingManager):
 
     @override
     def take_events(self) -> Iterable[OffloadingEvent]:
-        """Yield events owned by the primary and secondary tiers.
+        """Yield events owned by the secondary tiers.
 
         Yields:
             New OffloadingEvents collected by each tier since the last call.
 
         """
-        yield from self.primary_tier.take_events()
+        for _ in self.primary_tier.take_events():
+            pass
         for tier in self.secondary_tiers:
             yield from tier.take_events()
 

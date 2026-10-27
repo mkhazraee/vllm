@@ -422,6 +422,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     enable_telemetry=enable_telemetry,
                     operation_timeout_ms=operation_timeout_ms,
                     abandon_timeout_ms=abandon_timeout_ms,
+                    startup_timeout_seconds=60,
                     nixl_agent_name=nixl_agent_name,
                     nixl_listen_port=_nixl_listen_port,
                 ),
