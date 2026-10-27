@@ -186,7 +186,7 @@ def _make_tier(
     enable_telemetry: bool = False,
     secondary_g2_slots: int = 0,
     kvcr_service_socket_path: str | None = None,
-    guard_only_sources: bool | None = None,
+    pinless_guard_sources: bool | None = None,
     compatibility_digest: str | None = None,
     enable_kv_cache_events: bool = False,
     self_describing_kv_events: bool = False,
@@ -230,8 +230,8 @@ def _make_tier(
     }
     if backpressure is not None:
         tier_config["backpressure"] = backpressure
-    if guard_only_sources is not None:
-        tier_config["guard_only_sources"] = guard_only_sources
+    if pinless_guard_sources is not None:
+        tier_config["pinless_guard_sources"] = pinless_guard_sources
     tier = SecondaryTierFactory.create_secondary_tier(
         tier_config=tier_config,
         offloading_spec=SimpleNamespace(
@@ -327,20 +327,20 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
     assert (region.size, region.stride or region.size, region.count) == (16, 16, 4)
     assert (region.label, region.mem_type, region.device_Id) == ("", "DRAM", 0)
     assert kvcr.backend_configs.local_dram is None
-    assert tier.guard_only_sources is True
-    assert kvcr.backend_configs.remote_fw_dram.guard_only_sources is True
+    assert tier.pinless_guard_sources is True
+    assert kvcr.backend_configs.remote_fw_dram.pinless_guard_sources is True
 
 
 @pytest.mark.parametrize(
-    ("guard_service", "guard_only_sources", "expected_ownership"),
+    ("guard_service", "pinless_guard_sources", "expected_ownership"),
     [
         (True, None, ["kvcr"]),
         (True, False, ["kvcr", None]),
         (False, None, ["kvcr", None]),
     ],
 )
-def test_kvcr_tier_filters_events_only_for_guard_only_sources(
-    monkeypatch, guard_service, guard_only_sources, expected_ownership
+def test_kvcr_tier_filters_events_only_for_pinless_guard_sources(
+    monkeypatch, guard_service, pinless_guard_sources, expected_ownership
 ):
     kvcr = RecordingKVCR()
     tier = _make_tier(
@@ -348,13 +348,12 @@ def test_kvcr_tier_filters_events_only_for_guard_only_sources(
         kvcr,
         kvcr_service_socket_path="/tmp/kvcr.sock" if guard_service else None,
         compatibility_digest="Opaque-Digest" if guard_service else None,
-        guard_only_sources=guard_only_sources,
+        pinless_guard_sources=pinless_guard_sources,
     )
-    expected_guard_only = guard_service and guard_only_sources is not False
-    assert tier.guard_only_sources is expected_guard_only
+    expected_guard_only = guard_service and pinless_guard_sources is not False
+    assert tier.pinless_guard_sources is expected_guard_only
     assert (
-        kvcr.backend_configs.remote_fw_dram.guard_only_sources
-        is expected_guard_only
+        kvcr.backend_configs.remote_fw_dram.pinless_guard_sources is expected_guard_only
     )
     key = OffloadKey(b"k0")
     tier._inventory_events.extend(
