@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
-import msgspec
 import numpy as np
 import pytest
 
@@ -35,6 +34,7 @@ from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.kv_offload.base import (
     LookupResult,
     Medium,
+    OffloadingEvent,
     OffloadKey,
     ReqContext,
     make_offload_key,
@@ -186,6 +186,7 @@ def _make_tier(
     enable_telemetry: bool = False,
     secondary_g2_slots: int = 0,
     kvcr_service_socket_path: str | None = None,
+    no_pinning_mode: bool | None = None,
     compatibility_digest: str | None = None,
     enable_kv_cache_events: bool = False,
     self_describing_kv_events: bool = False,
@@ -229,6 +230,8 @@ def _make_tier(
     }
     if backpressure is not None:
         tier_config["backpressure"] = backpressure
+    if no_pinning_mode is not None:
+        tier_config["no_pinning_mode"] = no_pinning_mode
     tier = SecondaryTierFactory.create_secondary_tier(
         tier_config=tier_config,
         offloading_spec=SimpleNamespace(
@@ -324,6 +327,42 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
     assert (region.size, region.stride or region.size, region.count) == (16, 16, 4)
     assert (region.label, region.mem_type, region.device_Id) == ("", "DRAM", 0)
     assert kvcr.backend_configs.local_dram is None
+    assert tier.no_pinning_mode is True
+    assert kvcr.backend_configs.remote_fw_dram.no_pinning_mode is True
+
+
+@pytest.mark.parametrize(
+    ("guard_service", "no_pinning_mode", "expected_ownership"),
+    [
+        (True, None, ["kvcr"]),
+        (True, False, ["kvcr", None]),
+        (False, None, ["kvcr", None]),
+    ],
+)
+def test_kvcr_tier_filters_events_only_for_no_pinning_mode(
+    monkeypatch, guard_service, no_pinning_mode, expected_ownership
+):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(
+        monkeypatch,
+        kvcr,
+        kvcr_service_socket_path="/tmp/kvcr.sock" if guard_service else None,
+        compatibility_digest="Opaque-Digest" if guard_service else None,
+        no_pinning_mode=no_pinning_mode,
+    )
+    expected_guard_only = guard_service and no_pinning_mode is not False
+    assert tier.no_pinning_mode is expected_guard_only
+    assert kvcr.backend_configs.remote_fw_dram.no_pinning_mode is expected_guard_only
+    key = OffloadKey(b"k0")
+    tier._inventory_events.extend(
+        [
+            OffloadingEvent([key], Medium.CPU, removed=False, ownership="kvcr"),
+            OffloadingEvent([key], Medium.CPU, removed=False),
+        ]
+    )
+    assert [event.ownership for event in tier.take_events()] == expected_ownership
+    assert list(tier.take_events()) == []
+    tier.shutdown()
 
 
 def test_kvcr_tier_converts_g3_paths(monkeypatch, tmp_path):
@@ -367,9 +406,7 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch, backpressure):
 
     tier.on_new_request(ctx)
 
-    assert kvcr.submit_hint_calls == [
-        ((), {"request_id": "req", "hints": msgspec.to_builtins(kv_hint)})
-    ]
+    assert kvcr.submit_hint_calls == [((), {"request_id": "req", "hints": kv_hint})]
 
     bindings = kvcr.constructor_bindings
     assert bindings is not None

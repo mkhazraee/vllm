@@ -407,6 +407,13 @@ Runtime handshake for a P2P (or P/D) pull, once the orchestrator has set the key
 
 In classic **P/D mode** (`remote_prefiller` set, no `remote_kv_source`), the lookup phase (steps 2–4) is skipped: the decode consumer assumes the prefiller holds all of the request's blocks, so every block `lookup()` returns an immediate hit and the consumer jumps straight to the **`FetchMsg`** in step 5. The `LookupMsg`/`LookupRespMsg` round-trip only happens in P2P mode, where the consumer does not know in advance which blocks the peer has cached.
 
+### KVCR Guard source reads
+
+For a KVCR tier connected to a Guard service, `no_pinning_mode` defaults to
+`true`. It serves READY blocks from Guard-owned memory without a framework
+source-pin request. Set it to `false` to use framework-pinned source reads.
+Enabling it without a Guard service is invalid.
+
 ### Out-of-Tree Secondary Tiers
 
 Implement `SecondaryTierManager` (`vllm/v1/kv_offload/tiering/base.py`) in your own package — no vLLM fork or patch required — and point the tier config at it directly:

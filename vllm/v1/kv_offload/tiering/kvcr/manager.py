@@ -11,7 +11,6 @@ from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-import msgspec
 from kvcr import (
     DURATION_METRIC,
     KVCR,
@@ -139,6 +138,10 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _vllm_metric_name(STATE_METRIC): OffloadingGaugeMetadata(
             documentation="Current KVCR metadata and operation counts.",
             labelnames=("resource",),
+        ),
+        "vllm:kvcr_guard_source_events": OffloadingCounterMetadata(
+            documentation="Guard-only source events.",
+            labelnames=("event",),
         ),
     }
 
@@ -307,6 +310,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         g3: dict[str, Any] | None = None,
         local_dram_backend: str = "UCX",
         remote_fw_dram_backend: str = "UCX",
+        no_pinning_mode: bool | None = None,
         backpressure_detector: "BackpressureDetector | None" = None,
     ) -> None:
         super().__init__(
@@ -405,6 +409,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if kvcr_service_socket_path is not None and compatibility_digest is not None
             else None
         )
+        if no_pinning_mode is None:
+            no_pinning_mode = guard_config is not None
+        if no_pinning_mode and guard_config is None:
+            raise ValueError("no_pinning_mode requires a KVCR Guard service")
+        self.no_pinning_mode = no_pinning_mode
+        self.suppresses_primary_events = no_pinning_mode
         g3_config = None
         if g3 is not None:
             g3_values = dict(g3)
@@ -423,6 +433,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     abandon_timeout_ms=abandon_timeout_ms,
                     nixl_agent_name=nixl_agent_name,
                     nixl_listen_port=_nixl_listen_port,
+                    startup_timeout_seconds=900 if no_pinning_mode else None,
                 ),
                 KVCRBindings(
                     request_pin=self._framework_pin_adapter.request_pin,
@@ -454,6 +465,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                         opportunistic_query=opportunistic_query,
                         metadata_retry_interval_ms=metadata_retry_interval_ms,
                         backend=remote_fw_dram_backend,
+                        no_pinning_mode=no_pinning_mode,
                     ),
                 ),
                 guard_config,
@@ -611,6 +623,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     def take_events(self) -> Iterable[OffloadingEvent]:
         events = self._inventory_events
         self._inventory_events = []
+        if self.no_pinning_mode:
+            return [event for event in events if event.ownership == "kvcr"]
         return events
 
     @override
@@ -618,7 +632,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         if (hint := req_context.kv_hints) is not None:
             self._kvcr.submit_hint(
                 request_id=req_context.req_id,
-                hints=msgspec.to_builtins(hint),
+                hints=hint,
             )
         return RequestOffloadingContext()
 
