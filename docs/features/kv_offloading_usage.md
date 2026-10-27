@@ -409,7 +409,7 @@ In classic **P/D mode** (`remote_prefiller` set, no `remote_kv_source`), the loo
 
 ### KVCR Guard source reads
 
-For a KVCR tier connected to a Guard service, `pinless_guard_sources` defaults to
+For a KVCR tier connected to a Guard service, `no_pinning_mode` defaults to
 `true`. It serves READY blocks from Guard-owned memory without a framework
 source-pin request. Set it to `false` to use framework-pinned source reads.
 Enabling it without a Guard service is invalid.
