@@ -1006,7 +1006,16 @@ class TieringOffloadingManager(OffloadingManager):
             New OffloadingEvents collected by each tier since the last call.
 
         """
-        yield from self.primary_tier.take_events()
+        primary_events = self.primary_tier.take_events()
+        if any(
+            getattr(tier, "no_pinning_mode", False) is True
+            for tier in self.secondary_tiers
+        ):
+            # Drain events without advertising unpinnable framework sources.
+            for _ in primary_events:
+                pass
+        else:
+            yield from primary_events
         for tier in self.secondary_tiers:
             yield from tier.take_events()
 

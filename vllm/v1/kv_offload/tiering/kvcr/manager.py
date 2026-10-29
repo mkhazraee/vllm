@@ -465,6 +465,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         super().__init__(
             offloading_spec, primary_kv_view, tier_type, backpressure_detector
         )
+        self.no_pinning_mode = no_pinning_mode
         selected_policy = _resolve_policy(policy)
         if (kvcr_service_socket_path is None) != (compatibility_digest is None):
             raise ValueError(
