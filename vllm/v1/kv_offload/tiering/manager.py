@@ -34,12 +34,8 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
-    OffloadingCounterMetadata,
     OffloadingEvent,
-    OffloadingGaugeMetadata,
-    OffloadingHistogramMetadata,
     OffloadingManager,
-    OffloadingMetricMetadata,
     OffloadKey,
     OffloadPolicy,
     PrepareStoreOutput,
@@ -61,70 +57,6 @@ from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 logger = init_logger(__name__)
-
-
-def get_guard_put_metric_definitions(
-    extra_config: dict[str, object],
-) -> dict[str, OffloadingMetricMetadata]:
-    """Merge into the connector's metric registry using TOP-LEVEL extra_config.
-
-    Stats carry raw vllm: names. Secondary-tier metric hooks receive only the
-    nested tier config, so register this at OffloadPromMetrics construction (or
-    TieringOffloadingSpec.build_metric_definitions), not a secondary-tier hook.
-    """
-    if not extra_config.get("guard_put_batch_chunks", 0):
-        return {}
-    counters = {
-        "offered_chunks": (
-            "PUT key offers submitted to atomic admission, including retries."
-        ),
-        "admitted_chunks": "New PUT chunks allocated in the primary pool.",
-        "resolved_chunks": (
-            "PUT keys resolved by successful offers, including resident keys."
-        ),
-        "deferred_chunks": (
-            "Deferred chunk observations after successful offers; tails may recur."
-        ),
-        "abandoned_chunks": (
-            "Unadmitted PUT chunks abandoned while resolving source ranges."
-        ),
-        "source_unavailable_before_admission": (
-            "PUT chunks abandoned before admission because GPU sources retired."
-        ),
-        "credit_busy": (
-            "PUT admission attempts deferred by staging credits or GET reserve."
-        ),
-        "aligned_unit_deferred": (
-            "PUT plans whose minimum aligned unit exceeds available credits."
-        ),
-    }
-    gauges = {
-        "staging_chunks": (
-            "PUT primary slots held by writes, cascades, readers or parked cascades."
-        ),
-        "staging_high_water": (
-            "Maximum PUT staging slots held since batching activation."
-        ),
-        "admission_budget": (
-            "Conservative currently available PUT chunk admission credits."
-        ),
-    }
-    return {
-        **{
-            f"vllm:guard_put_{name}": OffloadingCounterMetadata(documentation=doc)
-            for name, doc in counters.items()
-        },
-        **{
-            f"vllm:guard_put_{name}": OffloadingGaugeMetadata(documentation=doc)
-            for name, doc in gauges.items()
-        },
-        "vllm:guard_put_batch_chunks": OffloadingHistogramMetadata(
-            documentation=(
-                "New chunks per successful PUT offer; zero for resident-only offers."
-            ),
-            buckets=(0, 1, 16, 32, 64, 128, 256, 384, 512),
-        ),
-    }
 
 
 @dataclass
@@ -707,7 +639,6 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_process_finished_jobs()
         if hasattr(self, "_put_max_inflight"):
             keys = list(dict.fromkeys(keys))
-            self._put_stats.increase_counter("vllm:guard_put_offered_chunks", len(keys))
             budget = self.get_put_admission_budget()
             state = self._req_state[req_context.req_id]
             # Existing keys also need credits if request-level cascades will
@@ -721,24 +652,13 @@ class TieringOffloadingManager(OffloadingManager):
                 for key in keys
             )
             if needed > budget:
-                self._put_stats.increase_counter("vllm:guard_put_credit_busy")
                 return None
         primary_result = self.primary_tier.prepare_store(keys, req_context)
         if primary_result is None:
             return None
-        if hasattr(self, "_put_max_inflight"):
-            self._put_stats.increase_counter(
-                "vllm:guard_put_admitted_chunks", len(primary_result.keys_to_store)
-            )
-            self._put_stats.increase_counter(
-                "vllm:guard_put_resolved_chunks", len(keys)
-            )
-            self._put_stats.observe_histogram(
-                "vllm:guard_put_batch_chunks", len(primary_result.keys_to_store)
-            )
         if primary_result.keys_to_store:
             if hasattr(self, "_put_max_inflight"):
-                self._track_put_staging(primary_result.keys_to_store)
+                self._put_staging_keys.update(primary_result.keys_to_store)
             state = self._req_state[req_context.req_id]
             state.pending_primary_stores += 1
         request_level_tiers = self._req_state[req_context.req_id].request_level_tiers
@@ -749,7 +669,7 @@ class TieringOffloadingManager(OffloadingManager):
             )
             if keys_already_in_primary:
                 if hasattr(self, "_put_max_inflight"):
-                    self._track_put_staging(keys_already_in_primary)
+                    self._put_staging_keys.update(keys_already_in_primary)
                 self._cascade_existing_chunks_to_request_level_tiers(
                     keys_already_in_primary, req_context, request_level_tiers
                 )
@@ -874,7 +794,7 @@ class TieringOffloadingManager(OffloadingManager):
         """
         primary_chunks_spec = self.primary_tier.prepare_read(keys, req_context)
         if hasattr(self, "_put_max_inflight"):
-            self._track_put_staging(keys)
+            self._put_staging_keys.update(keys)
         assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
         job_id = self._next_job_id()
         job_metadata = TransferJob(
@@ -1064,20 +984,6 @@ class TieringOffloadingManager(OffloadingManager):
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = self.primary_tier.get_stats()
-        if hasattr(self, "_put_max_inflight"):
-            budget = self.get_put_admission_budget()
-            self._put_stats.set_gauge("vllm:guard_put_admission_budget", budget)
-            self._put_stats.set_gauge(
-                "vllm:guard_put_staging_chunks", len(self._put_staging_keys)
-            )
-            self._put_stats.set_gauge(
-                "vllm:guard_put_staging_high_water", self._put_staging_high_water
-            )
-            if stats is None:
-                stats = self._put_stats
-            else:
-                stats.aggregate(self._put_stats)
-            self._put_stats = OffloadingConnectorStats()
         if stats is not None and stats.is_empty():
             stats = None
         self._metrics.record_backpressure(self.secondary_tiers)
@@ -1123,12 +1029,6 @@ class TieringOffloadingManager(OffloadingManager):
 
         self.primary_tier.shutdown()
 
-    def _track_put_staging(self, keys: Collection[OffloadKey]) -> None:
-        self._put_staging_keys.update(keys)
-        self._put_staging_high_water = max(
-            self._put_staging_high_water, len(self._put_staging_keys)
-        )
-
     def configure_put_batching(
         self, batch_chunks: int, max_inflight_chunks: int, get_reserve_chunks: int
     ) -> None:
@@ -1145,8 +1045,6 @@ class TieringOffloadingManager(OffloadingManager):
         self._put_max_inflight = max_inflight_chunks
         self._put_get_reserve = get_reserve_chunks
         self._put_staging_keys: set[OffloadKey] = set()
-        self._put_stats = OffloadingConnectorStats()
-        self._put_staging_high_water = 0
 
     def get_put_admission_budget(self) -> int:
         """Conservative credit bound; the atomic allocator remains authoritative.

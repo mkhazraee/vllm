@@ -619,7 +619,6 @@ class OffloadingConnectorScheduler:
         self._connector_stats = OffloadingConnectorStats()
         self._put_batch_chunks = spec.extra_config.get("guard_put_batch_chunks", 0)
         self._put_retry_after: ReqId | None = None
-        self._put_deferred: dict[ReqId, int] = {}
         self._put_retry_gate: dict[ReqId, tuple[tuple[int, ...], int]] = {}
         if self._put_batch_chunks:
             self.manager.configure_put_batching(
@@ -1339,7 +1338,7 @@ class OffloadingConnectorScheduler:
         new_block_ids_end: dict[str, tuple[int, ...]] = {}
         if self._put_batch_chunks:
             for req_id in scheduler_output.preempted_req_ids or ():
-                self._abandon_put_tail(req_id)
+                self._put_retry_gate.pop(req_id, None)
 
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             req_status = self._req_status[req_id]
@@ -1623,19 +1622,6 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
-    def _abandon_put_tail(self, req_id: ReqId) -> None:
-        self._put_retry_gate.pop(req_id, None)
-        self._record_put_abandoned(self._put_deferred.pop(req_id, 0))
-
-    def _record_put_abandoned(self, count: int) -> None:
-        if count:
-            self._connector_stats.increase_counter(
-                "vllm:guard_put_abandoned_chunks", count
-            )
-            self._connector_stats.increase_counter(
-                "vllm:guard_put_source_unavailable_before_admission", count
-            )
-
     def _clip_put_frontier(
         self,
         ranges: list[tuple[int, int]],
@@ -1708,7 +1694,7 @@ class OffloadingConnectorScheduler:
             req = req_status.req
             if self._put_batch_chunks:
                 if req_id in (scheduler_output.preempted_req_ids or ()):
-                    self._abandon_put_tail(req_id)
+                    self._put_retry_gate.pop(req_id, None)
                     continue
                 admission_state = self.manager.get_put_admission_state()
                 budget = admission_state[0]
@@ -1722,7 +1708,6 @@ class OffloadingConnectorScheduler:
                     continue
                 self._put_retry_gate.pop(req_id, None)
                 if budget == 0 and not req.is_finished():
-                    self._connector_stats.increase_counter("vllm:guard_put_credit_busy")
                     continue
 
             if req.status is RequestStatus.FINISHED_ABORTED:
@@ -1748,7 +1733,6 @@ class OffloadingConnectorScheduler:
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
             key_ends: list[tuple[int, OffloadKey, int, int]] = []
-            unavailable_ends: list[tuple[int, int]] = []
 
             reachable_boundaries: tuple[int, ...] = ()
             if self.config.retention_interval is not None:
@@ -1884,7 +1868,6 @@ class OffloadingConnectorScheduler:
                             )
                         )
                     ):
-                        unavailable_ends.append((group_config.group_idx, end_token))
                         continue
                     new_offload_keys.append(offload_key)
                     if self._put_batch_chunks:
@@ -1897,35 +1880,16 @@ class OffloadingConnectorScheduler:
                             )
                         )
 
-            if self._put_batch_chunks:
-                total = len(set(new_offload_keys))
-                self._put_deferred[req_id] = total + len(unavailable_ends)
-                if new_offload_keys:
-                    group_store_ranges, store_sources = self._clip_put_frontier(
-                        group_store_ranges, key_ends, budget
-                    )
-                    new_offload_keys = list(store_sources)
-                    if not new_offload_keys:
-                        self._connector_stats.increase_counter(
-                            "vllm:guard_put_aligned_unit_deferred"
-                        )
-                        self._put_retry_gate[req_id] = (admission_state, 0)
-                        continue
-                resolved_tokens = {
-                    group.group_idx: end * group.tokens_per_chunk
-                    for group, (_, end) in zip(
-                        self.config.kv_group_configs, group_store_ranges
-                    )
-                }
-                unavailable = sum(
-                    end <= resolved_tokens[group_idx]
-                    for group_idx, end in unavailable_ends
+            if self._put_batch_chunks and new_offload_keys:
+                group_store_ranges, store_sources = self._clip_put_frontier(
+                    group_store_ranges, key_ends, budget
                 )
+                new_offload_keys = list(store_sources)
+                if not new_offload_keys:
+                    self._put_retry_gate[req_id] = (admission_state, 0)
+                    continue
 
             if not new_offload_keys:
-                if self._put_batch_chunks:
-                    self._record_put_abandoned(unavailable)
-                    self._put_deferred.pop(req_id, None)
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
@@ -1944,13 +1908,6 @@ class OffloadingConnectorScheduler:
 
             if self._put_batch_chunks:
                 self._put_retry_after = req_id
-                self._record_put_abandoned(unavailable)
-                self._put_deferred[req_id] = (
-                    total - len(new_offload_keys) + len(unavailable_ends) - unavailable
-                )
-                self._connector_stats.increase_counter(
-                    "vllm:guard_put_deferred_chunks", self._put_deferred[req_id]
-                )
 
             if not store_output.keys_to_store:
                 if self._put_batch_chunks:
@@ -2116,7 +2073,7 @@ class OffloadingConnectorScheduler:
             if req_status is None:
                 continue
             if self._put_batch_chunks:
-                self._abandon_put_tail(req_id)
+                self._put_retry_gate.pop(req_id, None)
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -2304,7 +2261,6 @@ class OffloadingConnectorScheduler:
         self.manager.reset_cache()
 
         if self._put_batch_chunks:
-            self._put_deferred.clear()
             self._put_retry_gate.clear()
             self._put_retry_after = None
 
