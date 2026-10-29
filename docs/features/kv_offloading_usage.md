@@ -383,3 +383,29 @@ Example (OpenAI-compatible completions request):
 ## Further Reading
 
 - [vLLM blog: KV Offloading Connector](https://vllm.ai/blog/2026-01-08-kv-offloading-connector) — motivation, architecture (DMA-based async transfer), and benchmarks (TTFT and throughput).
+
+## Bounded secondary-tier PUT staging
+
+With `TieringOffloadingSpec`, these top-level `kv_connector_extra_config`
+settings bound GPU-to-CPU PUT admission on the existing primary pool:
+
+```json
+{
+  "guard_put_batch_chunks": 256,
+  "guard_put_max_inflight_chunks": 512,
+  "guard_put_get_reserve_chunks": 128
+}
+```
+
+Omitting `guard_put_batch_chunks` or setting it to zero disables batching.
+The batch and inflight limits must be positive integers, with the inflight
+limit at least the batch limit; the GET reserve must be a nonnegative integer.
+The scheduler admits whole token ranges aligned across all cache groups.
+A minimum aligned unit can exceed the batch target if it fits the available
+credits. Units larger than the inflight limit defer. Credits remain held through
+writes, secondary-tier cascades, and primary readers. Pool capacities are
+unchanged. Unadmitted tails are abandoned when their GPU sources retire.
+
+Metrics named `vllm:guard_put_*` report admission, deferral, abandonment, staging
+usage, and batch sizes. Deferred counts include repeated observations; admitted
+chunks do not imply secondary-tier completion.

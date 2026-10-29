@@ -34,8 +34,12 @@ from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
     LoadStoreSpec,
     LookupResult,
+    OffloadingCounterMetadata,
     OffloadingEvent,
+    OffloadingGaugeMetadata,
+    OffloadingHistogramMetadata,
     OffloadingManager,
+    OffloadingMetricMetadata,
     OffloadKey,
     OffloadPolicy,
     PrepareStoreOutput,
@@ -57,6 +61,70 @@ from vllm.v1.kv_offload.tiering.metrics import TieringMetricsTracker
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 logger = init_logger(__name__)
+
+
+def get_guard_put_metric_definitions(
+    extra_config: dict[str, object],
+) -> dict[str, OffloadingMetricMetadata]:
+    """Merge into the connector's metric registry using TOP-LEVEL extra_config.
+
+    Stats carry raw vllm: names. Secondary-tier metric hooks receive only the
+    nested tier config, so register this at OffloadPromMetrics construction (or
+    TieringOffloadingSpec.build_metric_definitions), not a secondary-tier hook.
+    """
+    if not extra_config.get("guard_put_batch_chunks", 0):
+        return {}
+    counters = {
+        "offered_chunks": (
+            "PUT key offers submitted to atomic admission, including retries."
+        ),
+        "admitted_chunks": "New PUT chunks allocated in the primary pool.",
+        "resolved_chunks": (
+            "PUT keys resolved by successful offers, including resident keys."
+        ),
+        "deferred_chunks": (
+            "Deferred chunk observations after successful offers; tails may recur."
+        ),
+        "abandoned_chunks": (
+            "Unadmitted PUT chunks abandoned while resolving source ranges."
+        ),
+        "source_unavailable_before_admission": (
+            "PUT chunks abandoned before admission because GPU sources retired."
+        ),
+        "credit_busy": (
+            "PUT admission attempts deferred by staging credits or GET reserve."
+        ),
+        "aligned_unit_deferred": (
+            "PUT plans whose minimum aligned unit exceeds available credits."
+        ),
+    }
+    gauges = {
+        "staging_chunks": (
+            "PUT primary slots held by writes, cascades, readers or parked cascades."
+        ),
+        "staging_high_water": (
+            "Maximum PUT staging slots held since batching activation."
+        ),
+        "admission_budget": (
+            "Conservative currently available PUT chunk admission credits."
+        ),
+    }
+    return {
+        **{
+            f"vllm:guard_put_{name}": OffloadingCounterMetadata(documentation=doc)
+            for name, doc in counters.items()
+        },
+        **{
+            f"vllm:guard_put_{name}": OffloadingGaugeMetadata(documentation=doc)
+            for name, doc in gauges.items()
+        },
+        "vllm:guard_put_batch_chunks": OffloadingHistogramMetadata(
+            documentation=(
+                "New chunks per successful PUT offer; zero for resident-only offers."
+            ),
+            buckets=(0, 1, 16, 32, 64, 128, 256, 384, 512),
+        ),
+    }
 
 
 @dataclass
@@ -636,32 +704,43 @@ class TieringOffloadingManager(OffloadingManager):
             evicted, or None if store cannot proceed.
 
         """
-        # Step 1: Poll for completed async jobs FIRST
-        # _process_finished_jobs() handles two kinds of completions here:
-        #  - Cascade completions (store to a secondary tier, either a local
-        #    cascade or a store job created for a remote requester via
-        #    create_store_job()): decrements ref_cnt on the primary chunks
-        #    that were read, making them evictable again once ref_cnt hits 0.
-        #  - Promotion completions (secondary->primary loads): sets a
-        #    not-yet-ready chunk's ref_cnt from -1 to 0 via complete_write(),
-        #    making it evictable for the first time.
-        # Both must be accounted for before the eviction decision below.
         self._maybe_process_finished_jobs()
-
-        # Step 2: Store to primary tier (new chunks only).
-        # Cascading of these newly-stored chunks to ALL secondary tiers
-        # happens later in complete_store(), after the GPU→Primary transfer
-        # completes.
+        if hasattr(self, "_put_max_inflight"):
+            keys = list(dict.fromkeys(keys))
+            self._put_stats.increase_counter("vllm:guard_put_offered_chunks", len(keys))
+            budget = self.get_put_admission_budget()
+            state = self._req_state[req_context.req_id]
+            # Existing keys also need credits if request-level cascades will
+            # newly pin them. Already charged keys consume no extra credit.
+            needed = sum(
+                key not in self._put_staging_keys
+                and (
+                    self.primary_tier._policy.get(key) is None
+                    or bool(state.request_level_tiers)
+                )
+                for key in keys
+            )
+            if needed > budget:
+                self._put_stats.increase_counter("vllm:guard_put_credit_busy")
+                return None
         primary_result = self.primary_tier.prepare_store(keys, req_context)
-
         if primary_result is None:
             return None
-
+        if hasattr(self, "_put_max_inflight"):
+            self._put_stats.increase_counter(
+                "vllm:guard_put_admitted_chunks", len(primary_result.keys_to_store)
+            )
+            self._put_stats.increase_counter(
+                "vllm:guard_put_resolved_chunks", len(keys)
+            )
+            self._put_stats.observe_histogram(
+                "vllm:guard_put_batch_chunks", len(primary_result.keys_to_store)
+            )
         if primary_result.keys_to_store:
+            if hasattr(self, "_put_max_inflight"):
+                self._track_put_staging(primary_result.keys_to_store)
             state = self._req_state[req_context.req_id]
             state.pending_primary_stores += 1
-
-        # Step 3: For request-level tiers, cascade chunks already in primary
         request_level_tiers = self._req_state[req_context.req_id].request_level_tiers
         if request_level_tiers:
             keys_to_store_set = set(primary_result.keys_to_store)
@@ -669,10 +748,11 @@ class TieringOffloadingManager(OffloadingManager):
                 k for k in keys if k not in keys_to_store_set
             )
             if keys_already_in_primary:
+                if hasattr(self, "_put_max_inflight"):
+                    self._track_put_staging(keys_already_in_primary)
                 self._cascade_existing_chunks_to_request_level_tiers(
                     keys_already_in_primary, req_context, request_level_tiers
                 )
-
         return primary_result
 
     def _cascade_existing_chunks_to_request_level_tiers(
@@ -781,10 +861,7 @@ class TieringOffloadingManager(OffloadingManager):
         self._maybe_finalize_request(req_id)
 
     def create_store_job(
-        self,
-        keys: Collection[OffloadKey],
-        req_context: ReqContext,
-        tier_idx: int = 0,
+        self, keys: Collection[OffloadKey], req_context: ReqContext, tier_idx: int = 0
     ) -> TransferJob:
         """Pin chunks in the primary tier and create a tracked store job.
 
@@ -796,6 +873,8 @@ class TieringOffloadingManager(OffloadingManager):
         reporting completion via get_finished_jobs().
         """
         primary_chunks_spec = self.primary_tier.prepare_read(keys, req_context)
+        if hasattr(self, "_put_max_inflight"):
+            self._track_put_staging(keys)
         assert isinstance(primary_chunks_spec, CPULoadStoreSpec)
         job_id = self._next_job_id()
         job_metadata = TransferJob(
@@ -948,18 +1027,11 @@ class TieringOffloadingManager(OffloadingManager):
         """
         for tier in self.secondary_tiers:
             tier.drain_jobs()
-        # All tier I/O has stopped; consume their completion notifications
-        # so manager bookkeeping is consistent before the primary reset.
         self._process_finished_jobs()
         assert not self._jobs
-
-        # Deferred promotion submissions reserve primary slots that the
-        # reset below invalidates; their submit_load() has not yet been
-        # called so no tier I/O is touching that memory.
         self._pending_load_submissions.clear()
         self._request_load_sources.clear()
         self._metrics.assert_idle()
-
         finished_req_ids = []
         for req_id, state in self._req_state.items():
             state.pending_primary_stores = 0
@@ -970,13 +1042,12 @@ class TieringOffloadingManager(OffloadingManager):
                 tier.on_request_finished(state.req_context)
             self._metrics.on_request_finished(state.req_context)
             finished_req_ids.append(req_id)
-
         self.primary_tier.reset_cache()
-
+        if hasattr(self, "_put_max_inflight"):
+            self._put_staging_keys.clear()
         for req_id in finished_req_ids:
             del self._req_state[req_id]
         self._processed_jobs_this_step = False
-
         for tier in self.secondary_tiers:
             if tier.bp_detector is not None:
                 tier.bp_detector.reset()
@@ -984,10 +1055,22 @@ class TieringOffloadingManager(OffloadingManager):
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = self.primary_tier.get_stats()
-
+        if hasattr(self, "_put_max_inflight"):
+            budget = self.get_put_admission_budget()
+            self._put_stats.set_gauge("vllm:guard_put_admission_budget", budget)
+            self._put_stats.set_gauge(
+                "vllm:guard_put_staging_chunks", len(self._put_staging_keys)
+            )
+            self._put_stats.set_gauge(
+                "vllm:guard_put_staging_high_water", self._put_staging_high_water
+            )
+            if stats is None:
+                stats = self._put_stats
+            else:
+                stats.aggregate(self._put_stats)
+            self._put_stats = OffloadingConnectorStats()
         if stats is not None and stats.is_empty():
             stats = None
-
         self._metrics.record_backpressure(self.secondary_tiers)
         metrics_stats = self._metrics.take_stats()
         if metrics_stats is not None:
@@ -995,7 +1078,6 @@ class TieringOffloadingManager(OffloadingManager):
                 stats = metrics_stats
             else:
                 stats.aggregate(metrics_stats)
-
         for tier in self.secondary_tiers:
             tier_stats = tier.get_stats()
             if tier_stats is None or tier_stats.is_empty():
@@ -1004,7 +1086,6 @@ class TieringOffloadingManager(OffloadingManager):
                 stats = tier_stats
             else:
                 stats.aggregate(tier_stats)
-
         return stats
 
     @override
@@ -1032,3 +1113,70 @@ class TieringOffloadingManager(OffloadingManager):
             raise shutdown_error
 
         self.primary_tier.shutdown()
+
+    def _track_put_staging(self, keys: Collection[OffloadKey]) -> None:
+        self._put_staging_keys.update(keys)
+        self._put_staging_high_water = max(
+            self._put_staging_high_water, len(self._put_staging_keys)
+        )
+
+    def configure_put_batching(
+        self, batch_chunks: int, max_inflight_chunks: int, get_reserve_chunks: int
+    ) -> None:
+        """Enable scheduler-owned PUT admission on the existing primary pool."""
+        if (
+            type(batch_chunks) is not int
+            or batch_chunks <= 0
+            or type(max_inflight_chunks) is not int
+            or max_inflight_chunks < batch_chunks
+            or type(get_reserve_chunks) is not int
+            or get_reserve_chunks < 0
+        ):
+            raise ValueError("Invalid guard PUT batching limits")
+        self._put_max_inflight = max_inflight_chunks
+        self._put_get_reserve = get_reserve_chunks
+        self._put_staging_keys: set[OffloadKey] = set()
+        self._put_stats = OffloadingConnectorStats()
+        self._put_staging_high_water = 0
+
+    def get_put_admission_budget(self) -> int:
+        """Conservative credit bound; the atomic allocator remains authoritative.
+
+        A D2H write has ref_cnt=-1. Cascade and load readers have ref_cnt>0.
+        Keep its credit until ALL such references are gone, including after
+        request finalization. Never return it at GPU->primary completion alone.
+        """
+        self._maybe_process_finished_jobs()
+        primary = self.primary_tier
+        parked_keys = {
+            key
+            for state in self._req_state.values()
+            for key in state.pending_cascade_keys
+        }
+        self._put_staging_keys = {
+            key
+            for key in self._put_staging_keys
+            if (chunk := primary._policy.get(key)) is not None
+            and (chunk.ref_cnt != 0 or key in parked_keys)
+        }
+        admissible = (
+            primary._get_num_free_chunks() + primary._num_evictable_cache_chunks
+        )
+        return max(
+            0,
+            min(
+                self._put_max_inflight - len(self._put_staging_keys),
+                admissible - self._put_get_reserve,
+            ),
+        )
+
+    def get_put_admission_state(self) -> tuple[int, ...]:
+        """Cheap capacity/completion signature for scheduler retry gating."""
+        primary = self.primary_tier
+        return (
+            self.get_put_admission_budget(),
+            primary._num_write_pending_chunks,
+            primary._num_evictable_cache_chunks,
+            self._job_id_counter,
+            len(self._jobs),
+        )

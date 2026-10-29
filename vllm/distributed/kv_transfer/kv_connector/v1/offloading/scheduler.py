@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
+from math import lcm
 from typing import Any, NamedTuple
 
 from vllm.config import VllmConfig
@@ -574,6 +575,16 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        self._put_batch_chunks = spec.extra_config.get("guard_put_batch_chunks", 0)
+        self._put_retry_after: ReqId | None = None
+        self._put_deferred: dict[ReqId, int] = {}
+        self._put_retry_gate: dict[ReqId, tuple[tuple[int, ...], int]] = {}
+        if self._put_batch_chunks:
+            self.manager.configure_put_batching(
+                self._put_batch_chunks,
+                spec.extra_config.get("guard_put_max_inflight_chunks", 512),
+                spec.extra_config.get("guard_put_get_reserve_chunks", 128),
+            )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -1284,6 +1295,9 @@ class OffloadingConnectorScheduler:
         # the i-th sliding window group (before this step's extend).
         # Used to detect sliding window blocks that got re-allocated.
         new_block_ids_end: dict[str, tuple[int, ...]] = {}
+        if self._put_batch_chunks:
+            for req_id in scheduler_output.preempted_req_ids or ():
+                self._abandon_put_tail(req_id)
 
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             req_status = self._req_status[req_id]
@@ -1567,20 +1581,107 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _abandon_put_tail(self, req_id: ReqId) -> None:
+        self._put_retry_gate.pop(req_id, None)
+        self._record_put_abandoned(self._put_deferred.pop(req_id, 0))
+
+    def _record_put_abandoned(self, count: int) -> None:
+        if count:
+            self._connector_stats.increase_counter(
+                "vllm:guard_put_abandoned_chunks", count
+            )
+            self._connector_stats.increase_counter(
+                "vllm:guard_put_source_unavailable_before_admission", count
+            )
+
+    def _clip_put_frontier(
+        self,
+        ranges: list[tuple[int, int]],
+        key_ends: list[tuple[int, OffloadKey, int, int]],
+        budget: int,
+    ) -> tuple[list[tuple[int, int]], dict[OffloadKey, tuple[int, int]]]:
+        """Select whole aligned multi-group units, never a flattened prefix.
+
+        Eligibility/masks were computed against the ORIGINAL store horizon.
+        Clipping must not make an intermediate frontier look like a final SWA
+        tail. A minimum unit may exceed the nominal batch size only if all its
+        keys fit real credits (which are bounded by the PUT staging limit).
+        """
+        alignment = lcm(
+            self.config.alignment_tokens or 1,
+            *(g.tokens_per_chunk for g in self.config.kv_group_configs),
+        )
+        units: dict[int, set[OffloadKey]] = {}
+        for end, key, _, _ in key_ends:
+            units.setdefault(cdiv(end, alignment) * alignment, set()).add(key)
+        chosen: set[OffloadKey] = set()
+        frontier = 0
+        for end, keys in sorted(units.items()):
+            size = len(chosen | keys)
+            if size > budget or (chosen and size > self._put_batch_chunks):
+                break
+            chosen.update(keys)
+            frontier = end
+        if chosen and len(chosen) == len({key for _, key, _, _ in key_ends}):
+            # All eligible keys fit: resolve legitimately skipped trailing
+            # ranges as the original scheduler did, including SWA decode gaps.
+            frontier = max(
+                end * group.tokens_per_chunk
+                for group, (_, end) in zip(self.config.kv_group_configs, ranges)
+            )
+        clipped = [
+            (start, max(start, min(end, frontier // group.tokens_per_chunk)))
+            for group, (start, end) in zip(self.config.kv_group_configs, ranges)
+        ]
+        # Preserve an eligible occurrence, not just key membership: a duplicate
+        # at an earlier position may have an unavailable or unreachable source.
+        # This mapping is bounded by the admitted frontier/credit limit, even
+        # though eligibility planning still enumerates the remaining tail.
+        sources: dict[OffloadKey, tuple[int, int]] = {}
+        for end, key, group_idx, chunk_idx in key_ends:
+            if end <= frontier:
+                sources.setdefault(key, (group_idx, chunk_idx))
+        # Insertion order preserves CPU/GPU transfer-spec correspondence.
+        return clipped, sources
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
     ) -> dict[int, TransferJob]:
         blocks_per_chunk = self.config.blocks_per_chunk
         store_jobs: dict[int, TransferJob] = {}
-        for req_id in chain(
+        req_ids = chain(
             scheduler_output.num_scheduled_tokens,
             scheduler_output.finished_req_ids or (),
-        ):
+        )
+        if self._put_batch_chunks:
+            req_ids = list(dict.fromkeys(req_ids))
+            if self._put_retry_after in req_ids:
+                start = req_ids.index(self._put_retry_after) + 1
+                req_ids = req_ids[start:] + req_ids[:start]
+        for req_id in req_ids:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
             req = req_status.req
+            if self._put_batch_chunks:
+                if req_id in (scheduler_output.preempted_req_ids or ()):
+                    self._abandon_put_tail(req_id)
+                    continue
+                admission_state = self.manager.get_put_admission_state()
+                budget = admission_state[0]
+                previous, retries = self._put_retry_gate.get(req_id, ((), 0))
+                if (
+                    previous == admission_state
+                    and retries < 15
+                    and not req.is_finished()
+                ):
+                    self._put_retry_gate[req_id] = (previous, retries + 1)
+                    continue
+                self._put_retry_gate.pop(req_id, None)
+                if budget == 0 and not req.is_finished():
+                    self._connector_stats.increase_counter("vllm:guard_put_credit_busy")
+                    continue
 
             if req.status is RequestStatus.FINISHED_ABORTED:
                 num_tokens_after_batch = req.num_computed_tokens
@@ -1604,6 +1705,8 @@ class OffloadingConnectorScheduler:
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
             group_store_ranges: list[tuple[int, int]] = []
+            key_ends: list[tuple[int, OffloadKey, int, int]] = []
+            unavailable_ends: list[tuple[int, int]] = []
 
             reachable_boundaries: tuple[int, ...] = ()
             if self.config.retention_interval is not None:
@@ -1699,7 +1802,7 @@ class OffloadingConnectorScheduler:
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
-                    if block_id == 0:
+                    if block_id == 0 and not self._put_batch_chunks:
                         continue
                     abs_chunk_idx = start_chunk_idx + key_idx
                     if (
@@ -1723,9 +1826,64 @@ class OffloadingConnectorScheduler:
                         for b in range(blocks_per_chunk)
                     ):
                         continue
+                    end_token = (abs_chunk_idx + 1) * group_config.tokens_per_chunk
+                    if self._put_batch_chunks and (
+                        block_id == 0
+                        or (
+                            req.is_finished()
+                            and any(
+                                bid in self._current_batch_allocated_block_ids
+                                for bid in group_state.block_ids[
+                                    abs_chunk_idx * blocks_per_chunk : (
+                                        abs_chunk_idx + 1
+                                    )
+                                    * blocks_per_chunk
+                                ]
+                            )
+                        )
+                    ):
+                        unavailable_ends.append((group_config.group_idx, end_token))
+                        continue
                     new_offload_keys.append(offload_key)
+                    if self._put_batch_chunks:
+                        key_ends.append(
+                            (
+                                end_token,
+                                offload_key,
+                                group_config.group_idx,
+                                abs_chunk_idx,
+                            )
+                        )
+
+            if self._put_batch_chunks:
+                total = len(set(new_offload_keys))
+                self._put_deferred[req_id] = total + len(unavailable_ends)
+                if new_offload_keys:
+                    group_store_ranges, store_sources = self._clip_put_frontier(
+                        group_store_ranges, key_ends, budget
+                    )
+                    new_offload_keys = list(store_sources)
+                    if not new_offload_keys:
+                        self._connector_stats.increase_counter(
+                            "vllm:guard_put_aligned_unit_deferred"
+                        )
+                        self._put_retry_gate[req_id] = (admission_state, 0)
+                        continue
+                resolved_tokens = {
+                    group.group_idx: end * group.tokens_per_chunk
+                    for group, (_, end) in zip(
+                        self.config.kv_group_configs, group_store_ranges
+                    )
+                }
+                unavailable = sum(
+                    end <= resolved_tokens[group_idx]
+                    for group_idx, end in unavailable_ends
+                )
 
             if not new_offload_keys:
+                if self._put_batch_chunks:
+                    self._record_put_abandoned(unavailable)
+                    self._put_deferred.pop(req_id, None)
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
@@ -1736,11 +1894,32 @@ class OffloadingConnectorScheduler:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
-                logger.warning("Request %s: cannot store chunks", req_id)
+                if self._put_batch_chunks:
+                    self._put_retry_gate[req_id] = (admission_state, 0)
+                else:
+                    logger.warning("Request %s: cannot store chunks", req_id)
                 continue
 
+            if self._put_batch_chunks:
+                self._put_retry_after = req_id
+                self._record_put_abandoned(unavailable)
+                self._put_deferred[req_id] = (
+                    total - len(new_offload_keys) + len(unavailable_ends) - unavailable
+                )
+                self._connector_stats.increase_counter(
+                    "vllm:guard_put_deferred_chunks", self._put_deferred[req_id]
+                )
+
             if not store_output.keys_to_store:
-                req_status.advance_stored_idx(num_offloadable_tokens)
+                if self._put_batch_chunks:
+                    for state, (_, end) in zip(
+                        req_status.group_states, group_store_ranges
+                    ):
+                        state.next_stored_chunk_idx = max(
+                            state.next_stored_chunk_idx, end
+                        )
+                else:
+                    req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
             keys_to_store = set(store_output.keys_to_store)
@@ -1767,8 +1946,12 @@ class OffloadingConnectorScheduler:
                 ):
                     if offload_key not in keys_to_store:
                         continue
-
                     chunk_idx = start_chunk_idx + idx
+                    if self._put_batch_chunks and store_sources.get(offload_key) != (
+                        group_config.group_idx,
+                        chunk_idx,
+                    ):
+                        continue
 
                     self._events_tracker.record_store(
                         req, group_config, chunk_idx, offload_key
@@ -1890,6 +2073,8 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
+            if self._put_batch_chunks:
+                self._abandon_put_tail(req_id)
             req_status.finished_signaled = True
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
@@ -2075,6 +2260,11 @@ class OffloadingConnectorScheduler:
 
         # Reset offloading manager cache
         self.manager.reset_cache()
+
+        if self._put_batch_chunks:
+            self._put_deferred.clear()
+            self._put_retry_gate.clear()
+            self._put_retry_after = None
 
         # Reset store progress so active requests re-offload from chunk 0.
         for status in self._req_status.values():

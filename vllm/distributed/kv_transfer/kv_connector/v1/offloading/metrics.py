@@ -323,9 +323,12 @@ class OffloadPromMetrics(KVConnectorPromMetrics):
         assert kv_transfer_config is not None
         extra_config = kv_transfer_config.kv_connector_extra_config
         spec_cls = OffloadingSpecFactory.get_spec_cls(extra_config)
+        from vllm.v1.kv_offload.tiering.manager import get_guard_put_metric_definitions
+
         self._offloading_metric_metadata: dict[str, OffloadingMetricMetadata] = {
             **spec_cls.build_metric_definitions(extra_config),
             **get_connector_metric_definitions(),
+            **get_guard_put_metric_definitions(extra_config),
         }
         from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
 
