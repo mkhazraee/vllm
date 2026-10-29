@@ -392,6 +392,23 @@ class TestTieringOffloadingManager:
         self.secondary_tier1.take_events.assert_called_once_with()
         self.secondary_tier2.take_events.assert_called_once_with()
 
+    def test_put_credits_hold_through_cascade_and_reader(self, manager_setup):
+        self.manager.configure_put_batching(2, 4, 1)
+        self._start_request()
+        keys = to_keys(range(4))
+        assert self.manager.get_put_admission_budget() == 4
+        assert self.manager.prepare_store(keys, _CTX) is not None
+        assert self.manager.get_put_admission_budget() == 0
+        # The fifth primary slot remains available for GETs, not another PUT.
+        assert self.manager.prepare_store(to_keys([4]), _CTX) is None
+        self.manager.complete_store(keys, _CTX)
+        self.primary_tier.prepare_read(keys, _CTX)
+        self._simulate_on_schedule_end()
+        self._simulate_on_schedule_end()
+        assert self.manager.get_put_admission_budget() == 0
+        self.primary_tier.complete_read(keys, _CTX)
+        assert self.manager.get_put_admission_budget() == 4
+
     def test_basic_store_to_primary(self, manager_setup):
         """Test basic store operation to primary tier."""
         chunks = to_keys(range(3))

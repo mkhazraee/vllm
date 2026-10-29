@@ -4966,3 +4966,63 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+@pytest.mark.parametrize("batch,budget,admitted", [(1, 1, 0), (1, 2, 2), (2, 4, 2)])
+def test_put_frontier_keeps_groups_aligned_and_sources_paired(batch, budget, admitted):
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._put_batch_chunks = batch
+    scheduler.config = SimpleNamespace(
+        alignment_tokens=16,
+        kv_group_configs=[SimpleNamespace(tokens_per_chunk=16)] * 2,
+    )
+    keys = to_keys(range(4))
+    entries = [
+        (16, keys[0], 0, 0),
+        (16, keys[1], 1, 0),
+        (32, keys[2], 0, 1),
+        (32, keys[3], 1, 1),
+    ]
+    ranges, sources = scheduler._clip_put_frontier([(0, 2), (0, 2)], entries, budget)
+    # One aligned unit fits even when another would exceed the batch size.
+    assert len(sources) == admitted
+    assert ranges == [(0, admitted // 2)] * 2
+    assert sources == dict(
+        (key, (group, chunk)) for _, key, group, chunk in entries[:admitted]
+    )
+
+
+def test_batched_stores_advance_cursor_without_reused_gpu_source():
+    scheduler = _make_partial_tail_scheduler()
+    scheduler.config = scheduler.config._replace(
+        kv_group_configs=scheduler.config.kv_group_configs[:1]
+    )
+    request = _make_partial_tail_request(scheduler)
+    request.num_prompt_tokens = request.num_tokens = 64
+    request.all_token_ids = list(range(64))
+    request.num_computed_tokens = 0
+    request.status = RequestStatus.RUNNING
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+    state = scheduler._req_status["req"]
+    state.group_states[0].block_ids[:] = [11, 12, 13, 14]
+    state.update_offload_keys()
+    scheduler._put_batch_chunks = 2
+    scheduler.manager.get_put_admission_state = MagicMock(return_value=(2, 0, 0, 0, 0))
+    scheduler.manager.prepare_store.side_effect = (
+        lambda keys, ctx: generate_store_output(keys)
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens={"req": 64},
+        finished_req_ids=set(),
+        preempted_req_ids=set(),
+    )
+    [first] = scheduler._build_store_jobs(output).values()
+    assert first.src_spec.block_ids.tolist() == [11, 12]
+    assert state.group_states[0].next_stored_chunk_idx == 2
+    request.is_finished.return_value = True
+    request.num_tokens = 65
+    request.all_token_ids.append(64)
+    scheduler._current_batch_allocated_block_ids = {14}
+    [second] = scheduler._build_store_jobs(output).values()
+    assert second.src_spec.block_ids.tolist() == [13]
+    assert state.group_states[0].next_stored_chunk_idx == 4

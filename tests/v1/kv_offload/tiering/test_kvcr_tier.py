@@ -28,6 +28,9 @@ from kvcr.types import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    RequestHashChain,
+)
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.kv_offload.base import (
     LookupResult,
@@ -558,3 +561,89 @@ def test_kvcr_tier_forwards_native_no_pinning_option(monkeypatch, no_pinning_mod
     assert kvcr.constructor_bindings.stats_factory is None
     assert kvcr.backend_configs.framework_regions[0].size == tier.block_size_bytes
     assert kvcr.backend_configs.framework_regions[0].count == 4
+
+
+@pytest.fixture
+def hinted_request():
+    hashes = tuple(i.to_bytes(32, "big") for i in range(1, 7))
+    hint = msgspec.convert(
+        dict(
+            protocol_version="0.1",
+            message_id="hint",
+            actions=[
+                dict(
+                    action_type="kv.fetch",
+                    action_id="fetch",
+                    action_version="1.0",
+                    payload=dict(
+                        source_control_endpoint="tcp://source:1", block_hashes=[4]
+                    ),
+                )
+            ],
+        ),
+        type=KvHintsEnvelope,
+    )
+    ctx = ReqContext(req_id="hinted", kv_hints=hint)
+    ctx.set_state(
+        RequestHashChain("hinted", hashes, 4, ((0, 8), (1, 16)), 16, id(hashes))
+    )
+    return ctx, hashes
+
+
+def test_hint_closure_limits_remote_authority_to_trusted_group_prefix(
+    monkeypatch, hinted_request
+):
+    ctx, hashes = hinted_request
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    tier.on_new_request(ctx)
+    seen = []
+
+    def query(keys, request_id):
+        seen.append(request_id)
+        return [(QueryStatus.HIT, CacheTier.LOCAL_G2)]
+
+    monkeypatch.setattr(kvcr, "query", query)
+    for index, group, expected in (
+        (1, 0, "hinted"),
+        (0, 0, None),
+        (5, 0, None),
+        (1, 9, None),
+    ):
+        assert (
+            tier.lookup(make_offload_key(hashes[index], group), ctx) is LookupResult.HIT
+        )
+        assert seen[-1] == expected
+    expanded = kvcr.submit_hint_calls[-1][1]["hints"]
+    assert set(expanded["actions"][0]["payload"]["block_hashes"]) == {2, 4}
+
+
+def test_partitioned_hint_load_waits_for_both_parts(monkeypatch, hinted_request):
+    ctx, hashes = hinted_request
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    tier.on_new_request(ctx)
+    keys = [make_offload_key(hashes[index], 0) for index in (1, 0)]
+    tier.submit_load(TransferJob(13, keys, np.array([0, 1]), True, ctx))
+    assert [request_id for _, _, request_id in kvcr.deliver_calls] == ["hinted", None]
+    kvcr.completed.clear()
+    first, second = [handle for handle, _, _ in kvcr.deliver_calls]
+    kvcr.complete(first, {keys[0]: True})
+    assert list(tier.get_finished_jobs()) == []
+    kvcr.complete(second, {keys[1]: False})
+    [result] = tier.get_finished_jobs()
+    assert result.job_id == 13 and not result.success
+    assert result.successful_keys == {keys[0]}
+
+
+@pytest.mark.parametrize("anchors", [[4, 4], [99], [2]])
+def test_invalid_hint_anchors_revoke_remote_authority(
+    monkeypatch, hinted_request, anchors
+):
+    ctx, hashes = hinted_request
+    ctx.kv_hints.actions[0].payload["block_hashes"] = anchors
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    tier.on_new_request(ctx)
+    tier.lookup(make_offload_key(hashes[1], 0), ctx)
+    assert kvcr.discard_hint_calls == ["hinted"]
