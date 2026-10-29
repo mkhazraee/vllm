@@ -809,3 +809,40 @@ def test_tier_override_wins_over_top_level():
 def test_tier_without_backpressure_stays_unconfigured():
     spec = _build_tiering_spec([{"type": "example"}])
     assert "backpressure" not in spec.secondary_tier_configs[0]
+
+
+def test_no_pinning_primary_removal_does_not_withdraw_guard_residency():
+    from vllm.v1.kv_offload.tiering.manager import TieringOffloadingManager
+
+    tracker, req, group, key = _lookup_chunk()
+    manager = TieringOffloadingManager.__new__(TieringOffloadingManager)
+    manager.primary_tier = MagicMock()
+    secondary = MagicMock()
+    secondary.no_pinning_mode = True
+    manager.secondary_tiers = [secondary]
+
+    manager.primary_tier.take_events.return_value = iter([_stored_event([key])])
+    secondary.take_events.return_value = iter(())
+    assert list(tracker.take_events(manager.take_events())) == []
+
+    manager.primary_tier.take_events.return_value = iter(())
+    secondary.take_events.return_value = iter(
+        [_stored_event([key], ownership="kvcr", removal_expected=True)]
+    )
+    [stored] = tracker.take_events(manager.take_events())
+    assert isinstance(stored, BlockStored)
+    assert stored.ownership == "kvcr"
+
+    manager.primary_tier.take_events.return_value = iter([_removed_event([key])])
+    secondary.take_events.return_value = iter(())
+    assert list(tracker.take_events(manager.take_events())) == []
+    assert (Medium.CPU, "kvcr") in tracker._pending_event_metadata[
+        key
+    ].active_residencies
+
+    manager.primary_tier.take_events.return_value = iter(())
+    secondary.take_events.return_value = iter([_removed_event([key], ownership="kvcr")])
+    [removed] = tracker.take_events(manager.take_events())
+    assert isinstance(removed, BlockRemoved)
+    assert removed.block_hashes == stored.block_hashes
+    assert removed.ownership == "kvcr"

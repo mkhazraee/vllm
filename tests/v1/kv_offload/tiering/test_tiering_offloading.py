@@ -1545,3 +1545,56 @@ def test_parse_tier_filter_skips_bad_entries():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("no_pinning_mode", [False, True])
+def test_no_pinning_inventory_omits_only_framework_sources(no_pinning_mode):
+    """Primary completion cannot advertise a source before Guard READY."""
+    primary = CPUPrimaryTierOffloadingManager(
+        4, _mock_mmap_region(4), enable_events=True
+    )
+    secondary = MagicMock()
+    secondary.no_pinning_mode = no_pinning_mode
+    secondary.take_events.return_value = iter(())
+    manager = TieringOffloadingManager(primary, [secondary])
+    context = ReqContext(req_id="inventory")
+    keys = to_keys([1])
+    assert primary.prepare_store(keys, context) is not None
+    primary.complete_store(keys, context)
+    events = list(manager.take_events())
+    assert [event.keys for event in events] == ([] if no_pinning_mode else [keys])
+    assert list(primary.take_events()) == []
+
+    # A failed cascade emits no READY: the primary-only source stays unadvertised.
+    secondary.take_events.return_value = iter(())
+    assert list(manager.take_events()) == []
+
+    # Evict the primary slot after a completed cascade has published Guard READY.
+    secondary.take_events.return_value = iter(
+        [OffloadingEvent(keys=keys, medium=Medium.CPU, removed=False, ownership="kvcr")]
+    )
+    assert len(list(manager.take_events())) == 1
+    replacement_keys = to_keys([10, 11, 12, 13])
+    assert primary.prepare_store(replacement_keys, context) is not None
+    primary.complete_store(replacement_keys, context)
+    secondary.take_events.return_value = iter(())
+    eviction_events = list(manager.take_events())
+    if no_pinning_mode:
+        assert eviction_events == []
+    else:
+        assert any(event.removed and event.keys == keys for event in eviction_events)
+
+    # Only Guard-owned residency and its later withdrawal authorize routing.
+    for removed in (False, True):
+        guard_event = OffloadingEvent(
+            keys=keys, medium=Medium.CPU, removed=removed, ownership="kvcr"
+        )
+        secondary.take_events.return_value = iter([guard_event])
+        assert list(manager.take_events()) == [guard_event]
+
+    # Other secondary tiers retain their existing event ownership semantics.
+    storage_event = OffloadingEvent(
+        keys=to_keys([3]), medium=Medium.STORAGE, removed=False
+    )
+    secondary.take_events.return_value = iter([storage_event])
+    assert list(manager.take_events()) == [storage_event]

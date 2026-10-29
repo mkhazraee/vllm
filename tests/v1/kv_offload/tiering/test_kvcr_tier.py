@@ -18,7 +18,7 @@ from kvcr.types import (
     BlockKey,
     CacheTier,
     InventoryEvent,
-    MemDescriptor,
+    MemoryRef,
     OpEntryResult,
     OpEntryStatus,
     OpHandle,
@@ -66,6 +66,7 @@ class _StubControlChannel:
 
 class RecordingKVCR:
     def __init__(self) -> None:
+        self._core = SimpleNamespace()
         self.config: KVCRConfig | None = None
         self.guard_config: KVCRGuardConfig | None = None
         self.backend_configs = KVCRBackendConfigs()
@@ -78,11 +79,9 @@ class RecordingKVCR:
         self.submit_hint_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.discard_hint_calls: list[str] = []
         self.deliver_calls: list[
-            tuple[OpHandle, dict[BlockKey, list[MemDescriptor]], str | None]
+            tuple[OpHandle, dict[BlockKey, list[MemoryRef]], str | None]
         ] = []
-        self.deposit_calls: list[
-            tuple[OpHandle, dict[BlockKey, list[MemDescriptor]]]
-        ] = []
+        self.deposit_calls: list[tuple[OpHandle, dict[BlockKey, list[MemoryRef]]]] = []
         self.completed: list[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = []
         self._next_op_handle = 1
 
@@ -107,7 +106,7 @@ class RecordingKVCR:
 
     def deliver(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
         request_id: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
@@ -118,7 +117,7 @@ class RecordingKVCR:
 
     def deposit(
         self,
-        blocks: Mapping[BlockKey, list[MemDescriptor]],
+        blocks: Mapping[BlockKey, list[MemoryRef]],
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
@@ -173,6 +172,7 @@ def _make_tier(
     kvcr: RecordingKVCR,
     *,
     enable_telemetry: bool = False,
+    no_pinning_mode: bool = False,
     secondary_g2_slots: int = 0,
     kvcr_service_socket_path: str | None = None,
     compatibility_digest: str | None = None,
@@ -217,6 +217,7 @@ def _make_tier(
         control_ports=control_ports if control_ports is not None else [7777],
         control_advertise_host="127.0.0.1",
         enable_telemetry=enable_telemetry,
+        no_pinning_mode=no_pinning_mode,
         secondary_g2_slots=secondary_g2_slots,
         kvcr_service_socket_path=kvcr_service_socket_path,
         compatibility_digest=compatibility_digest,
@@ -248,7 +249,7 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
         compatibility_digest="Opaque-Digest",
     )
     assert kvcr.config is not None
-    assert kvcr.config.pool_layouts == [("", tier._primary_row_stride)]
+    assert kvcr.config.pool_layouts == [("", tier.block_size_bytes)]
     assert kvcr.backend_configs.local_dram is None
 
 
@@ -303,12 +304,12 @@ def test_kvcr_tier_adapts_request_and_load(monkeypatch):
     # Check load destinations and job completion independently of hint parsing.
     assert len(kvcr.submit_hint_calls) == 1
     _, blocks, request_id = kvcr.deliver_calls[0]
-    assert request_id == "req"
+    # Without a trusted scheduler chain, hinted loads stay local-only.
+    assert request_id is None
     assert list(blocks) == [key]
     (descriptor,) = blocks[key]
     assert descriptor.end_point_name == kvcr.nixl_agent_name
-    assert descriptor.addr == tier._primary_base_addr + 2 * 16
-    assert descriptor.size == 16
+    assert descriptor.element_index == 2
     assert list(tier.get_finished_jobs()) == [JobResult(7, True)]
 
     # Here we verify that request cleanup discards the request-scoped hint in
@@ -388,7 +389,7 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     block_descriptors = descriptors[keys[2]]
     assert block_descriptors is not None
     (descriptor,) = block_descriptors
-    assert descriptor.addr == (tier._primary_base_addr + 5 * tier._primary_row_stride)
+    assert descriptor.element_index == 5
     assert lifecycle == ["new", "finished"]
 
     polls = 0
@@ -482,14 +483,14 @@ def test_kvcr_tier_stores_and_emits_inventory(monkeypatch):
     local_dram = kvcr.backend_configs.local_dram
     assert local_dram is not None
     assert [(name, size) for name, _, size in local_dram.pools] == [
-        ("", 2 * tier._primary_row_stride)
+        ("", 2 * tier.block_size_bytes)
     ]
 
     key = OffloadKey(b"k0")
     tier.submit_store(_job(11, ReqContext(req_id="req"), key=key, chunk_id=2))
 
     _, blocks = kvcr.deposit_calls[0]
-    assert blocks[key][0].addr == tier._primary_base_addr + 2 * 16
+    assert blocks[key][0].element_index == 2
     assert list(tier.get_finished_jobs()) == [JobResult(11, True)]
 
     assert kvcr.inventory_sink is not None
@@ -546,3 +547,14 @@ def test_kvcr_tier_accumulates_block_results(monkeypatch):
     assert result.job_id == 13
     assert not result.success
     assert result.successful_keys == {keys[0]}
+
+
+@pytest.mark.parametrize("no_pinning_mode", [False, True])
+def test_kvcr_tier_forwards_native_no_pinning_option(monkeypatch, no_pinning_mode):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, no_pinning_mode=no_pinning_mode)
+    assert kvcr.backend_configs.remote_fw_dram.no_pinning_mode is no_pinning_mode
+    assert kvcr.backend_configs.remote_fw_dram.opportunistic_query is False
+    assert kvcr.constructor_bindings.stats_factory is None
+    assert kvcr.backend_configs.framework_regions[0].size == tier.block_size_bytes
+    assert kvcr.backend_configs.framework_regions[0].count == 4
