@@ -409,3 +409,14 @@ unchanged. Unadmitted tails are abandoned when their GPU sources retire.
 Metrics named `vllm:guard_put_*` report admission, deferral, abandonment, staging
 usage, and batch sizes. Deferred counts include repeated observations; admitted
 chunks do not imply secondary-tier completion.
+
+For a KVCR secondary tier, `no_pinning_mode` is a tier configuration option
+that defaults to `false` and is forwarded to KVCR's native remote DRAM options.
+Set it to `true` when using Guard-owned sources without framework source pinning.
+It does not require telemetry or capture output.
+
+KVCR router hints authorize remote fetches only when their ordered anchors
+match the scheduler's trusted request hash chain. The adapter expands that
+prefix across the configured cache groups and checks full-key membership and
+group boundaries. Invalid or unsupported hints become remote misses; local
+Guard hits remain available. Opportunistic remote queries default to disabled.

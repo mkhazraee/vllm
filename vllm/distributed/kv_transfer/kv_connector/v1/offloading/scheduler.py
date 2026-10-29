@@ -69,6 +69,19 @@ MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
 
 
+@dataclass(frozen=True)
+class RequestHashChain:
+    """Trusted scheduler prefix, never supplied by a frontend hint."""
+
+    request_id: str
+    block_hashes: tuple[bytes, ...]
+    tokens_per_hash: int
+    group_chunks: tuple[tuple[int, int], ...]
+    anchor_tokens: int | None
+    chain_owner: int
+    coherent: bool = True
+
+
 @dataclass(slots=True)
 class TransferJobStatus:
     """Tracks scheduler-side state for a single transfer job."""
@@ -419,6 +432,35 @@ class RequestOffloadState:
             )
 
     def update_offload_keys(self) -> None:
+        if getattr(self.req_context, "kv_hints", None) is not None:
+            previous = self.req_context.get_state(RequestHashChain)
+            hashes = self.req.block_hashes
+            if (
+                previous is None
+                or previous.chain_owner != id(hashes)
+                or len(previous.block_hashes) != len(hashes)
+                or (hashes and previous.block_hashes[-1] != hashes[-1])
+            ):
+                snapshot = tuple(hashes)
+                coherent = previous is None or (
+                    previous.coherent
+                    and previous.request_id == self.req.request_id
+                    and snapshot[: len(previous.block_hashes)] == previous.block_hashes
+                )
+                self.req_context.set_state(
+                    RequestHashChain(
+                        self.req.request_id,
+                        snapshot,
+                        self.config.tokens_per_hash,
+                        tuple(
+                            (g.group_idx, g.tokens_per_chunk)
+                            for g in self.config.kv_group_configs
+                        ),
+                        self.config.alignment_tokens,
+                        id(hashes),
+                        coherent,
+                    )
+                )
         for group_config, group_state in zip(
             self.config.kv_group_configs, self.group_states
         ):

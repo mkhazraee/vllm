@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM secondary-tier adapter for KVCR."""
 
+import copy
 import ctypes
 import mmap
 import socket
@@ -139,6 +140,167 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             labelnames=("resource",),
         ),
     }
+
+
+class _HintClosureState:
+    def __init__(self, raw_hint):
+        self.raw_hint = copy.deepcopy(raw_hint)
+        self.chain = None
+        self.valid = False
+        self.proof = None
+        self.proof_id = None
+        self.raw_anchors = frozenset()
+        self.reason = None
+
+
+def _get_request_hash_chain(req_context):
+    # Scheduler is fully imported before managers handle a lookup. Keep the
+    # generic scheduler independent of the KVCR backend and native SDK.
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        RequestHashChain,
+    )
+
+    return req_context.get_state(RequestHashChain)
+
+
+def _hint_key_position(proof, key):
+    if type(key) is not bytes or len(key) != 36:
+        return None
+    span = proof["_groups"].get(int.from_bytes(key[-4:], "big"))
+    end = proof["_positions"].get(key[:-4])
+    if (
+        span is None
+        or end is None
+        or end > proof["covered_through_tokens"]
+        or end % span
+    ):
+        return None
+    return end
+
+
+def _strict_hint_prefix_closure(chain, raw_hint):
+    if not getattr(chain, "coherent", True):
+        raise ValueError("request_chain_changed")
+    hashes, step = chain.block_hashes, chain.tokens_per_hash
+    if (
+        type(step) is not int
+        or step <= 0
+        or not isinstance(hashes, tuple)
+        or not hashes
+        or any(type(h) is not bytes or len(h) != 32 for h in hashes)
+    ):
+        raise ValueError("malformed_request_chain")
+    groups = chain.group_chunks
+    if (
+        not isinstance(groups, tuple)
+        or not groups
+        or any(
+            not isinstance(g, tuple)
+            or len(g) != 2
+            or type(g[0]) is not int
+            or not 0 <= g[0] < 1 << 32
+            or type(g[1]) is not int
+            or g[1] <= 0
+            or g[1] % step
+            for g in groups
+        )
+        or len({g[0] for g in groups}) != len(groups)
+    ):
+        raise ValueError("malformed_group_boundaries")
+    anchor_step = chain.anchor_tokens
+    if type(anchor_step) is not int or anchor_step <= 0 or anchor_step % step:
+        raise ValueError("unknown_anchor_geometry")
+    if not isinstance(raw_hint, dict) or raw_hint.get("protocol_version") != "0.1":
+        raise ValueError("unsupported_hint_protocol")
+    actions = raw_hint.get("actions")
+    if not isinstance(actions, list):
+        raise ValueError("malformed_hint_actions")
+    action = next(
+        (
+            a
+            for a in actions
+            if isinstance(a, dict) and a.get("action_type") == "kv.fetch"
+        ),
+        None,
+    )
+    if action is None or action.get("action_version") != "1.0":
+        raise ValueError("unsupported_fetch_action")
+    payload = action.get("payload")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("mode", "copy") != "copy"
+        or "no_retain" in payload
+    ):
+        raise ValueError("unsupported_fetch_payload")
+    source, raw = payload.get("source_control_endpoint"), payload.get("block_hashes")
+    if (
+        not isinstance(source, str)
+        or not source
+        or not isinstance(raw, list)
+        or not raw
+        or any(type(h) is not int or not 0 <= h < 1 << 64 for h in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        raise ValueError("malformed_or_repeated_anchor")
+    import hashlib
+
+    positions, full_positions = {}, {}
+    raw_set = set(raw)
+    chain_digest = hashlib.sha256()
+    # One scan: retain only raw-anchor projections, build the exact-key index
+    # by full hash, and digest the chain without a second full-hash dictionary.
+    for index, h in enumerate(hashes, 1):
+        chain_digest.update(h)
+        end = index * step
+        if h in full_positions:
+            raise ValueError("repeated_request_hash")
+        full_positions[h] = end
+        value = int.from_bytes(h[-8:], "big")
+        if value in raw_set:
+            if value in positions:
+                raise ValueError("foreign_or_ambiguous_anchor")
+            positions[value] = end
+    ends = []
+    for value in raw:
+        end = positions.get(value)
+        if end is None:
+            raise ValueError("foreign_or_ambiguous_anchor")
+        if end % anchor_step or (ends and end <= ends[-1]):
+            raise ValueError("unaligned_or_unordered_anchor")
+        ends.append(end)
+    cutoff = ends[-1]
+    effective, seen = list(raw), set(raw)
+    effective_digest = hashlib.sha256()
+    for value in raw:
+        effective_digest.update(value.to_bytes(8, "big"))
+    every_position = min(span for _, span in groups) == step
+    spans = tuple(set(span for _, span in groups))
+    for index in range(cutoff // step):
+        end = (index + 1) * step
+        if every_position or any(end % span == 0 for span in spans):
+            value = int.from_bytes(hashes[index][-8:], "big")
+            if value not in seen:
+                seen.add(value)
+                effective.append(value)
+                effective_digest.update(value.to_bytes(8, "big"))
+    return dict(
+        source_endpoint=source,
+        raw_hint_hashes=list(raw),
+        effective_hint_hash_count=len(effective),
+        effective_hint_hashes_sha256=effective_digest.hexdigest(),
+        anchor_positions=ends,
+        covered_through_tokens=cutoff,
+        tokens_per_hash=step,
+        group_chunks=groups,
+        chain_hash_count=len(hashes),
+        chain_sha256=chain_digest.hexdigest(),
+        full_chain_reconstructed=False,
+        anchor_tokens=anchor_step,
+        hash_codec="vllm-u64-big-endian-low64",
+        _effective_hashes=effective,
+        _positions=full_positions,
+        _groups=dict(groups),
+    )
 
 
 class _FrameworkPinAdapter:
@@ -284,7 +446,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         control_ports: list[int] | None = None,
         control_advertise_host: str | None = None,
         eager_ctrl_connect: bool = True,
-        opportunistic_query: bool = True,
+        opportunistic_query: bool = False,
         enable_telemetry: bool = False,
         operation_timeout_ms: int = 1000,
         abandon_timeout_ms: int = 5000,
@@ -458,11 +620,19 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._local_dram_mmap = local_mapping
         self._finished_jobs: list[JobResult] = []
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
+        self._load_job_parts: dict[int, list] = {}
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        closure = self._ensure_hint_closure(req_context)
+        remote_allowed = closure is None or (
+            closure.valid and _hint_key_position(closure.proof, bytes(key)) is not None
+        )
         block_key = self._key_adapter.encode(key)
-        status, _ = self._kvcr.query((block_key,), req_context.req_id)[0]
+        # Missing remote authority never suppresses local Guard residency.
+        status, _ = self._kvcr.query(
+            (block_key,), req_context.req_id if remote_allowed else None
+        )[0]
         if status is QueryStatus.FETCHING:
             return LookupResult.RETRY
         if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
@@ -482,16 +652,53 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(job_id=job_metadata.job_id, success=True)
             )
             return
-
-        op_handle = self._kvcr.deliver(
-            blocks, request_id=job_metadata.req_context.req_id
-        )
-        self._jobs_by_op[op_handle] = (
-            job_metadata.job_id,
-            len(blocks),
-            True,
-            set(),
-        )
+        ctx = job_metadata.req_context
+        state = self._ensure_hint_closure(ctx)
+        remote, local = {}, {}
+        for key, refs in blocks.items():
+            allowed = state is None or (
+                state.valid and _hint_key_position(state.proof, bytes(key)) is not None
+            )
+            (remote if allowed else local)[key] = refs
+        partitions = [
+            (part, request_id)
+            for part, request_id in ((remote, ctx.req_id), (local, None))
+            if part
+        ]
+        self._load_job_parts[job_metadata.job_id] = [len(partitions), True, set()]
+        for part, request_id in partitions:
+            # Ineligible local hits stay local-only even if evicted between
+            # lookup and dispatch. Native cleanup ownership is unchanged.
+            op_handle = self._kvcr.deliver(part, request_id=request_id)
+            self._jobs_by_op[op_handle] = (job_metadata.job_id, len(part), True, set())
+            output = getattr(self._kvcr._core, "_compact_capture", None)
+            if output is not None and state is not None:
+                keys = list(part)
+                for offset in range(0, len(keys), 128):
+                    chunk = keys[offset : offset + 128]
+                    output.journal(
+                        dict(
+                            event="hint_prefix_selected",
+                            closure_schema=1,
+                            proof_id=state.proof_id,
+                            agent=self._kvcr._core.nixl_agent_name,
+                            request_id=ctx.req_id,
+                            target_op=op_handle,
+                            remote_allowed=request_id is not None,
+                            source_endpoint=state.proof["source_endpoint"]
+                            if state.valid
+                            else None,
+                            key_offset=offset,
+                            total_keys=len(keys),
+                            keys=chunk,
+                            end_tokens=[
+                                _hint_key_position(state.proof, bytes(k))
+                                if state.valid
+                                else None
+                                for k in chunk
+                            ],
+                        )
+                    )
 
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
@@ -546,9 +753,11 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             success = success and all(entry.success for entry in entries.values())
             if successful_keys is not None:
                 successful_keys.update(
-                    OffloadKey(bytes(key))
-                    for key, entry in entries.items()
-                    if entry.success
+                    (
+                        OffloadKey(bytes(key))
+                        for key, entry in entries.items()
+                        if entry.success
+                    )
                 )
             if remaining > 0:
                 self._jobs_by_op[op_handle] = (
@@ -559,6 +768,19 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
+            part = (
+                getattr(self, "_load_job_parts", {}).get(job_id)
+                if successful_keys is not None
+                else None
+            )
+            if part is not None:
+                part[0] -= 1
+                part[1] = part[1] and success
+                part[2].update(successful_keys)
+                if part[0]:
+                    continue
+                self._load_job_parts.pop(job_id)
+                success, successful_keys = part[1], part[2]
             results.append(
                 JobResult(
                     job_id=job_id,
@@ -583,10 +805,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         if (hint := req_context.kv_hints) is not None:
-            self._kvcr.submit_hint(
-                request_id=req_context.req_id,
-                hints=msgspec.to_builtins(hint),
-            )
+            try:
+                state = _HintClosureState(msgspec.to_builtins(hint))
+                req_context.set_state(state)
+                self._kvcr.submit_hint(
+                    request_id=req_context.req_id, hints=state.raw_hint
+                )
+            except (ValueError, TypeError):
+                self._kvcr.discard_hint(req_context.req_id)
         return RequestOffloadingContext()
 
     @override
@@ -632,4 +858,95 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         return MemoryRef(
             end_point_name=self._kvcr.config.nixl_agent_name,
             element_index=chunk_id,
+        )
+
+    def _ensure_hint_closure(self, req_context):
+        state = req_context.get_state(_HintClosureState)
+        if state is None:
+            return None
+        chain = _get_request_hash_chain(req_context)
+        if chain is None:
+            return state  # No trusted scheduler chain yet: prompt explicit miss.
+        if chain is state.chain:
+            return state
+        previous = state.chain
+        state.chain = chain
+        try:
+            if chain.request_id != req_context.req_id or not chain.coherent:
+                raise ValueError("request_chain_scope_changed")
+            if state.valid and previous is not None:
+                if (
+                    chain.tokens_per_hash != previous.tokens_per_hash
+                    or chain.group_chunks != previous.group_chunks
+                    or chain.anchor_tokens != previous.anchor_tokens
+                    or len(chain.block_hashes) < len(previous.block_hashes)
+                ):
+                    raise ValueError("request_chain_geometry_changed")
+                if any(
+                    int.from_bytes(h[-8:], "big") in state.raw_anchors
+                    for h in chain.block_hashes[len(previous.block_hashes) :]
+                ):
+                    raise ValueError("appended_ambiguous_anchor")
+                return state  # Stable prefix; no recopy, resubmit or reserialization.
+            proof = _strict_hint_prefix_closure(chain, state.raw_hint)
+            probe = chain.block_hashes[0] + chain.group_chunks[0][0].to_bytes(4, "big")
+            decoded = self._key_adapter.decode(probe)
+            if type(decoded) is not int or decoded != int.from_bytes(
+                probe[24:32], "big"
+            ):
+                raise ValueError("unsupported_runtime_hash_codec")
+            expanded = copy.deepcopy(state.raw_hint)
+            action = next(
+                a for a in expanded["actions"] if a.get("action_type") == "kv.fetch"
+            )
+            action["payload"]["block_hashes"] = proof["_effective_hashes"]
+            self._kvcr.submit_hint(request_id=req_context.req_id, hints=expanded)
+            state.proof = proof
+            state.raw_anchors = frozenset(proof["raw_hint_hashes"])
+            state.valid, state.reason = True, "verified_request_prefix"
+            self._record_hint_closure(req_context, state, proof)
+        except (ValueError, TypeError, AttributeError) as error:
+            state.valid, state.reason = False, str(error)[:160]
+            state.proof = None
+            self._kvcr.discard_hint(req_context.req_id)
+            self._record_hint_closure(req_context, state)
+        return state
+
+    def _record_hint_closure(self, req_context, state, proof=None):
+        output = getattr(self._kvcr._core, "_compact_capture", None)
+        if output is None:
+            return
+        agent = self._kvcr._core.nixl_agent_name
+        proof_id = uuid.uuid4().hex
+        if state.valid:
+            state.proof_id = proof_id
+        record = dict(
+            event="hint_prefix_closure",
+            closure_schema=1,
+            proof_id=proof_id,
+            agent=agent,
+            request_id=req_context.req_id,
+            valid=state.valid,
+            reason=state.reason,
+        )
+        if proof is not None:
+            record.update((k, v) for k, v in proof.items() if not k.startswith("_"))
+        output.journal(record)
+        output.emit(
+            dict(
+                event="hint_prefix_closure",
+                closure_schema=1,
+                proof_id=proof_id,
+                identity=agent,
+                agent=agent,
+                request_id=req_context.req_id,
+                valid=state.valid,
+                reason=state.reason,
+                source_endpoint=(proof or {}).get("source_endpoint"),
+                raw_hint_hash_count=len((proof or {}).get("raw_hint_hashes", ())),
+                effective_hint_hash_count=(proof or {}).get(
+                    "effective_hint_hash_count", 0
+                ),
+                covered_through_tokens=(proof or {}).get("covered_through_tokens"),
+            )
         )
