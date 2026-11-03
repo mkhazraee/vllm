@@ -6435,3 +6435,147 @@ class TestMambaHybridOffloadServing:
             False,
         ]
         assert self._roundtrip_served_tokens(scheduler) == 16
+
+
+def _make_put_scheduler(batch=256, capacity=873, spans=(16,)):
+    from vllm.v1.kv_offload.tiering.manager import (
+        CPUPrimaryTierOffloadingManager,
+        TieringOffloadingManager,
+    )
+
+    config = _make_vllm_config(
+        extra_config={
+            "guard_put_batch_chunks": batch,
+            "guard_put_max_inflight_chunks": 512,
+            "guard_put_get_reserve_chunks": 128,
+        }
+    )
+    config.speculative_config = None
+    kv_config = KVCacheConfig(
+        num_blocks=6000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                [f"layer{i}"],
+                FullAttentionSpec(
+                    block_size=span,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            )
+            for i, span in enumerate(spans)
+        ],
+    )
+    region = MagicMock(spec=SharedOffloadRegion)
+    region.create_kv_memoryview.return_value = memoryview(
+        bytearray(capacity * 16)
+    ).cast("B", shape=(capacity, 16))
+    manager = TieringOffloadingManager(
+        CPUPrimaryTierOffloadingManager(capacity, region)
+    )
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_config))
+    spec.manager = manager
+    return OffloadingConnectorScheduler(spec, config, kv_config)
+
+
+def _put_request(scheduler, request_id, chunks):
+    init_none_hash(sha256)
+    request = Request(
+        request_id=request_id,
+        prompt_token_ids=[sum(request_id.encode()) + i for i in range(chunks * 16)],
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(16, sha256),
+    )
+    request.status = RequestStatus.RUNNING
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request_id]
+    state.update_offload_keys()
+    for group, config in zip(state.group_states, scheduler.config.kv_group_configs):
+        group.block_ids[:] = list(range(1, chunks * 16 // config.tokens_per_block + 1))
+    return request, state
+
+
+def _put_output(requests):
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {r.request_id: r.num_prompt_tokens for r in requests}
+    return output
+
+
+def test_put_oversized_offer_progresses_in_bounded_batches():
+    scheduler = _make_put_scheduler()
+    request, state = _put_request(scheduler, "large", 5384)
+    output = _put_output([request])
+    sizes = []
+    while state.group_states[0].next_stored_chunk_idx < 5384:
+        [job_id] = scheduler._build_store_jobs(output)
+        keys = scheduler._jobs[job_id].keys
+        sizes.append(len(keys))
+        scheduler.manager.complete_store(keys, state.req_context)
+    assert sizes == [256] * 21 + [8]
+
+
+@pytest.mark.parametrize(
+    "batch,capacity,admitted", [(4, 873, True), (2, 873, True), (2, 130, False)]
+)
+def test_put_heterogeneous_frontier_keeps_groups_aligned(batch, capacity, admitted):
+    scheduler = _make_put_scheduler(batch=batch, capacity=capacity, spans=(16, 32))
+    request, state = _put_request(scheduler, "hybrid", 8)
+    jobs = scheduler._build_store_jobs(_put_output([request]))
+    if not admitted:
+        assert not jobs
+        assert [s.next_stored_chunk_idx for s in state.group_states] == [0, 0]
+        return
+    [job] = jobs.values()
+    assert job.src_spec.group_sizes == [2, 1]
+    assert [s.next_stored_chunk_idx for s in state.group_states] == [2, 1]
+    assert job.src_spec.block_ids.tolist() == [1, 2, 1]
+
+
+@pytest.mark.parametrize("unavailable", ["null", "reused"])
+def test_put_duplicate_key_uses_eligible_occurrence(unavailable):
+    scheduler = _make_put_scheduler(batch=2)
+    request, state = _put_request(scheduler, "duplicate", 4)
+    group = state.group_states[0]
+    group.offload_keys[1] = group.offload_keys[0]
+    if unavailable == "null":
+        group.block_ids[0] = 0
+    else:
+        request.num_computed_tokens = request.num_prompt_tokens
+        request.append_output_token_ids(0)
+        request.status = RequestStatus.FINISHED_STOPPED
+        scheduler._current_batch_allocated_block_ids.add(1)
+    [job] = scheduler._build_store_jobs(_put_output([request])).values()
+    assert job.src_spec.block_ids.tolist() == [2, 3]
+    assert group.next_stored_chunk_idx == 3
+
+
+def test_put_requests_rotate_after_admission():
+    scheduler = _make_put_scheduler(capacity=384)
+    first, first_state = _put_request(scheduler, "first", 512)
+    second, second_state = _put_request(scheduler, "second", 512)
+    output = _put_output([first, second])
+    [job_id] = scheduler._build_store_jobs(output)
+    assert scheduler._jobs[job_id].req_id == "first"
+    scheduler.manager.complete_store(
+        scheduler._jobs[job_id].keys, first_state.req_context
+    )
+    [job_id] = scheduler._build_store_jobs(output)
+    assert scheduler._jobs[job_id].req_id == "second"
+    assert second_state.group_states[0].next_stored_chunk_idx == 256
+
+
+def test_put_unchanged_alignment_rejection_retries_every_sixteen_visits():
+    scheduler = _make_put_scheduler(batch=2, capacity=130, spans=(16, 32))
+    request, state = _put_request(scheduler, "deferred", 8)
+    output = _put_output([request])
+    assert not scheduler._build_store_jobs(output)
+    signature, retries = scheduler._put_retry_gate[request.request_id]
+    assert retries == 0
+    for visit in range(1, 16):
+        assert not scheduler._build_store_jobs(output)
+        assert scheduler._put_retry_gate[request.request_id] == (signature, visit)
+    assert not scheduler._build_store_jobs(output)
+    assert scheduler._put_retry_gate[request.request_id] == (signature, 0)
+    assert [s.next_stored_chunk_idx for s in state.group_states] == [0, 0]

@@ -1502,6 +1502,29 @@ class TestTieringOffloadingManager:
             if call.args[0].req_context.req_id == req_id
         ]
 
+    def test_put_credit_holds_parked_request_level_cascade(
+        self, manager_setup, monkeypatch
+    ):
+        self.manager.configure_put_batching(2, 4, 1)
+        self._start_request()
+        keys = to_keys(range(4))
+        assert self.manager.prepare_store(keys, _CTX) is not None
+        other = self._make_request_level_request(monkeypatch, "parked")
+        assert self.manager.prepare_store(keys, other) is not None
+        self.manager.complete_store(keys, _CTX)
+        self.manager._process_finished_jobs()
+        # D2H and its cascades finished, but the second request still owns intent.
+        for key in keys:
+            chunk = self.primary_tier._policy.get(key)
+            assert chunk is not None and chunk.ref_cnt == 0
+        assert self.manager.get_put_admission_budget() == 0
+        self._simulate_on_schedule_end()
+        for key in keys:
+            chunk = self.primary_tier._policy.get(key)
+            assert chunk is not None and chunk.ref_cnt == 1
+        assert self._cascaded_keys_for("parked") == [set(keys)]
+        assert self.manager.get_put_admission_budget() == 4
+
     def test_cascade_rejects_retry_from_primary(self, manager_setup, monkeypatch):
         """RETRY would be parked with no guarantee of ever draining, so the
         cascade refuses it. No real primary tier returns it, so this is the one
@@ -2022,3 +2045,48 @@ def test_tiering_spec_rejects_a_tier_that_declares_the_reserved_tier_label():
         pytest.raises(AssertionError, match="reserved label 'tier'"),
     ):
         TieringOffloadingSpec.config_info_keys({"secondary_tiers": tier_configs})
+
+
+@pytest.mark.parametrize("resident", [False, True])
+def test_put_get_reserve_counts_free_and_evictable_slots(resident):
+    primary = CPUPrimaryTierOffloadingManager(5, _mock_mmap_region(5))
+    manager = TieringOffloadingManager(primary)
+    manager.on_new_request(_CTX)
+    if resident:
+        keys = to_keys(range(5))
+        manager.prepare_store(keys, _CTX)
+        manager.complete_store(keys, _CTX)
+    manager.configure_put_batching(2, 4, 1)
+    assert manager.get_put_admission_budget() == 4
+    assert manager.prepare_store(to_keys(range(10, 14)), _CTX) is not None
+    assert manager.get_put_admission_budget() == 0
+    assert manager.prepare_store(to_keys([14]), _CTX) is None
+    # The reserved slot remains available to the primary's GET/promotion path.
+    assert primary.prepare_write(to_keys([14]), _CTX) is not None
+
+
+def test_put_credit_waits_for_secondary_completion_and_last_reader():
+    primary = CPUPrimaryTierOffloadingManager(5, _mock_mmap_region(5))
+    tier = MetricsSecondaryTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=primary.get_kv_memoryview(),
+        tier_type="delayed",
+    )
+    manager = TieringOffloadingManager(primary, [tier])
+    manager.configure_put_batching(2, 4, 1)
+    manager.on_new_request(_CTX)
+    keys = to_keys(range(4))
+    assert manager.prepare_store(keys, _CTX) is not None
+    manager.complete_store(keys, _CTX)
+    manager.on_request_finished(_CTX)
+    assert manager.get_put_admission_budget() == 0
+    primary.prepare_read(keys, _CTX)
+    # A secondary job finishes only after its caller has committed the fill.
+    tier.finished_jobs = [
+        JobResult(job_id=j.job_id, success=True) for j in tier.submitted_stores
+    ]
+    manager.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
+    manager.on_schedule_end(ScheduleEndContext(new_req_ids=[], preempted_req_ids=()))
+    assert manager.get_put_admission_budget() == 0
+    primary.complete_read(keys, _CTX)
+    assert manager.get_put_admission_budget() == 4
